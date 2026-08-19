@@ -33,6 +33,97 @@ Security:
 import asyncio
 import base64
 import binascii
+
+
+# ---------------------------------------------------------------------------
+# Streaming voice callback for voip-bridge calls
+# ---------------------------------------------------------------------------
+# Webhook deliveries for one call carry X-Webhook-Chat=<call_id>. When a
+# delivery is processed, gateway/run.py attaches this callback to
+# run_conversation: every text delta of the assistant reply is POSTed to
+# the bridge's /stream endpoint, so TTS starts on the FIRST sentence while
+# the LLM is still generating the rest (speech overlaps generation).
+# Deltas are buffered and flushed on sentence boundaries / size / time so
+# the bridge gets a handful of chunks instead of one POST per token.
+
+
+def build_voice_stream_callback(chat_id):
+    """Return a stream_callback for a webhook delivery, or None."""
+    import re
+    m = re.match(r"^webhook:(?:call-events|incoming-call):(.+)$", chat_id or "")
+    if not m:
+        return None
+    call_id = m.group(1)
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly()
+        vp = (cfg.get("mcp_servers") or {}).get("voip-bridge") or {}
+        url = (vp.get("url") or "").rstrip("/")
+        if not url:
+            return None
+        base = url.rsplit("/mcp", 1)[0] + "/stream"
+        auth = (vp.get("headers") or {}).get("Authorization", "")
+    except Exception:
+        return None
+
+    import json as _json
+    import threading
+    import time as _time
+    import urllib.request
+
+    _lock = threading.Lock()
+    _buf = []
+    _last_flush = _time.monotonic()
+    _SENT_BOUNDARY = re.compile(r"[.!?…]\s*$")
+    _MAX_CHUNK = 300
+    _OOB_BLOCK = re.compile(r"\[OUT-OF-BAND USER MESSAGE[^\]]*\]\s*")
+    _LEADING_BRACKET = re.compile(r"^\s*\[[^\]]*\]\s*")
+
+    def _strip_oob(text):
+        # GigaChat echoes the webhook prompt's [OUT-OF-BAND USER MESSAGE ...]
+        # block before the real reply — never speak it.
+        t = _OOB_BLOCK.sub("", text)
+        t = _LEADING_BRACKET.sub("", t)
+        return t.strip()
+
+    def _flush(end=False):
+        nonlocal _buf, _last_flush
+        text = _strip_oob("".join(_buf))
+        _buf = []
+        _last_flush = _time.monotonic()
+        if not text:
+            return
+        body = _json.dumps(
+            {"call_id": call_id, "delta": text, "end": end}
+        ).encode()
+        req = urllib.request.Request(
+            base, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        if auth:
+            req.add_header("Authorization", auth)
+        try:
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as exc:
+            logger.debug("[webhook] voice stream POST failed: %s", exc)
+
+    def _cb(delta):
+        if delta is None:
+            with _lock:
+                _flush(end=True)
+            return
+        with _lock:
+            _buf.append(delta)
+            text = "".join(_buf)
+            now = _time.monotonic()
+            if (
+                len(text) >= _MAX_CHUNK
+                or _SENT_BOUNDARY.search(text)
+                or now - _last_flush > 1.5
+            ):
+                _flush(end=False)
+
+    return _cb
 import hashlib
 import hmac
 import json
@@ -909,7 +1000,22 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Use delivery_id in session key so concurrent webhooks on the
         # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # X-Webhook-Chat (optional) groups deliveries into ONE session key -
+        # the voip-bridge sends the call_id here so every call event lands
+        # in the same conversation and the agent keeps dialog memory.
+        chat_key = request.headers.get("X-Webhook-Chat") or delivery_id
+        session_chat_id = f"webhook:{route_name}:{chat_key}"
+        # Keep the session alive across deliveries of one call: while
+        # X-Webhook-Chat is set and X-Webhook-End != 1, the session is NOT
+        # closed after the response, so the next event resumes the same
+        # conversation (dialog memory).
+        _keep = getattr(self, "_webhook_keep_alive", None)
+        if _keep is None:
+            _keep = self._webhook_keep_alive = set()
+        if chat_key and request.headers.get("X-Webhook-End") != "1":
+            _keep.add(session_chat_id)
+        else:
+            _keep.discard(session_chat_id)
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -1005,6 +1111,12 @@ class WebhookAdapter(BasePlatformAdapter):
         and key construction match exactly), then closes it via the existing
         ``SessionDB.end_session`` API — never a hand-written UPDATE.
         """
+        if session_chat_id in getattr(self, "_webhook_keep_alive", set()):
+            logger.debug(
+                "[webhook] Keeping session %s alive (call in progress)",
+                session_chat_id,
+            )
+            return
         runner = self.gateway_runner
         if runner is None:
             return
