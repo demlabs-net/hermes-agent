@@ -6228,6 +6228,19 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            # Streaming voice for voip-bridge calls: webhook deliveries
+            # carry X-Webhook-Chat=<call_id>; stream the assistant reply
+            # deltas to the bridge /stream endpoint so TTS starts on the
+            # first sentence while the LLM is still generating the rest.
+            try:
+                from gateway.platforms.webhook import build_voice_stream_callback
+                _voice_cb = build_voice_stream_callback(
+                    getattr(getattr(ctx, "source", None), "chat_id", None)
+                )
+                if _voice_cb is not None:
+                    _conversation_kwargs["stream_callback"] = _voice_cb
+            except Exception as _vcb_exc:
+                logger.debug("voice stream callback setup failed: %s", _vcb_exc)
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
