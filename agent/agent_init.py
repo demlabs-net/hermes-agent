@@ -1906,6 +1906,46 @@ def init_agent(
     # conversation loop's intent-ack block.
     agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
+    try:
+        agent._intent_ack_max_continuations = max(
+            0, int(_agent_section.get("intent_ack_max_continuations", 2))
+        )
+    except (TypeError, ValueError):
+        agent._intent_ack_max_continuations = 2
+    try:
+        agent._intent_ack_max_chars = max(
+            0, int(_agent_section.get("intent_ack_max_chars", 1200))
+        )
+    except (TypeError, ValueError):
+        agent._intent_ack_max_chars = 1200
+
+    # Optional completion contract for API/delegated work. Integrations can
+    # require one explicit tool result without coupling Hermes to that tool's
+    # implementation or MCP server.
+    agent._required_terminal_tools = _agent_section.get("required_terminal_tools", [])
+    agent._required_terminal_tool_platforms = _agent_section.get(
+        "required_terminal_tool_platforms", []
+    )
+    agent._required_terminal_tool_user_pattern = _agent_section.get(
+        "required_terminal_tool_user_pattern", ""
+    )
+    try:
+        agent._required_terminal_tool_max_nudges = max(
+            0, int(_agent_section.get("required_terminal_tool_max_nudges", 2))
+        )
+    except (TypeError, ValueError):
+        agent._required_terminal_tool_max_nudges = 2
+    try:
+        agent._required_terminal_tool_force_after_searches = max(
+            0,
+            int(_agent_section.get("required_terminal_tool_force_after_searches", 2)),
+        )
+    except (TypeError, ValueError):
+        agent._required_terminal_tool_force_after_searches = 2
+    agent._required_terminal_tool_nudge = str(
+        _agent_section.get("required_terminal_tool_nudge", "") or ""
+    ).strip()
+
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance
     # applies to ALL models, not just the model families enforcement

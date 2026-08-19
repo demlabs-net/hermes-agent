@@ -455,3 +455,7 @@ VOLUME [ "/opt/data" ]
 # intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
+
+# Source and bundled resources must remain readable when the swarm supplies a
+# non-root runtime UID rather than the image's default account.
+RUN chmod -R a+rX /opt/hermes

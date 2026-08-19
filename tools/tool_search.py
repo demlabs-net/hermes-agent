@@ -96,6 +96,9 @@ class ToolSearchConfig:
     # Absolute cap on the embedded listing, regardless of context size.
     # Effective budget = min(listing_max_tokens, threshold_pct% of context).
     listing_max_tokens: int = 4000
+    # Protocol-critical tools that keep their complete schema visible while
+    # other MCP/plugin tools remain behind progressive disclosure.
+    always_visible: tuple[str, ...] = ()
 
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
@@ -144,6 +147,18 @@ class ToolSearchConfig:
         else:
             listing = "auto"
         listing_max_tokens = max(200, min(60000, _safe_int(raw.get("listing_max_tokens"), 4000)))
+        always_visible_raw = raw.get("always_visible", ())
+        if isinstance(always_visible_raw, str):
+            always_visible_values = always_visible_raw.split(",")
+        elif isinstance(always_visible_raw, (list, tuple, set)):
+            always_visible_values = always_visible_raw
+        else:
+            always_visible_values = ()
+        always_visible = tuple(dict.fromkeys(
+            str(value).strip()
+            for value in always_visible_values
+            if str(value).strip()
+        ))
 
         return cls(
             enabled=enabled,
@@ -152,6 +167,7 @@ class ToolSearchConfig:
             max_search_limit=max_search_limit,
             listing=listing,
             listing_max_tokens=listing_max_tokens,
+            always_visible=always_visible,
         )
 
 
@@ -795,6 +811,16 @@ def assemble_tool_defs(
                 if (td.get("function") or {}).get("name") not in BRIDGE_TOOL_NAMES]
 
     visible, deferrable = classify_tools(incoming)
+    if config.always_visible and deferrable:
+        pinned_names = set(config.always_visible)
+        pinned = [
+            tool_def
+            for tool_def in deferrable
+            if (tool_def.get("function") or {}).get("name") in pinned_names
+        ]
+        if pinned:
+            visible.extend(pinned)
+            deferrable = [tool_def for tool_def in deferrable if tool_def not in pinned]
     if not deferrable:
         return AssemblyResult(tool_defs=incoming, activated=False)
 

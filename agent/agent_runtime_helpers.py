@@ -3753,21 +3753,28 @@ def looks_like_codex_intermediate_ack(
     is ``true`` or a model-list), so general autonomous workflows ("I'll run a
     health check on the server", "I'll start the deployment") — which carry a
     future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+    In the default codex-only mode, a prior tool result suppresses the detector
+    to preserve historical behavior. Explicit all-mode opt-in keeps detecting
+    bounded intermediate acknowledgements after tools.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    if require_workspace and any(
+        isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages
+    ):
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
     if not assistant_text:
         return False
-    if len(assistant_text) > 1200:
+    max_chars = max(0, int(getattr(agent, "_intent_ack_max_chars", 1200)))
+    if max_chars and len(assistant_text) > max_chars:
         return False
 
     has_future_ack = bool(
-        re.search(r"\b(i['’]ll|i will|let me|i can do that|i can help with that)\b", assistant_text)
+        re.search(
+            r"\b(i['’]ll|i will|let me|i can do that|i can help with that|"
+            r"продолж(?:у|аю|аем|им)|перейду|приступлю)\b",
+            assistant_text,
+        )
     )
     if not has_future_ack:
         return False
@@ -3776,6 +3783,7 @@ def looks_like_codex_intermediate_ack(
         "look into",
         "look at",
         "inspect",
+        "continue",
         "scan",
         "check",
         "analyz",
@@ -3792,6 +3800,13 @@ def looks_like_codex_intermediate_ack(
         "walkthrough",
         "report back",
         "summarize",
+        "продолж",
+        "аудит",
+        "провер",
+        "откро",
+        "запущ",
+        "исслед",
+        "проанализ",
     )
     workspace_markers = (
         "directory",

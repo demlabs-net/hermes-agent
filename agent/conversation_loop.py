@@ -1845,6 +1845,7 @@ def run_conversation(
     interrupted = False
     failed = False
     codex_ack_continuations = 0
+    terminal_tool_guard_nudges = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
@@ -2806,6 +2807,61 @@ def run_conversation(
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
+                # After repeated exact searches or skill-name confusion for a
+                # configured completion tool, constrain one request to that
+                # tool. This is scoped by the same platform/message contract as
+                # the stop guard and never activates without explicit config.
+                try:
+                    from agent.terminal_tool_guard import (
+                        forced_terminal_tool_after_repeated_searches,
+                        terminal_tool_request_scope,
+                    )
+
+                    _forced_terminal_tool = forced_terminal_tool_after_repeated_searches(
+                        agent=agent,
+                        user_message=user_message,
+                        messages=messages,
+                        current_turn_user_idx=current_turn_user_idx,
+                    )
+                    _request_tool_names = {
+                        str(
+                            (tool.get("function") or {}).get("name")
+                            or tool.get("name")
+                            or ""
+                        )
+                        for tool in (api_kwargs.get("tools") or [])
+                        if isinstance(tool, dict)
+                    }
+                    if _forced_terminal_tool in _request_tool_names:
+                        if agent.api_mode == "anthropic_messages":
+                            api_kwargs["tool_choice"] = _forced_terminal_tool
+                        elif agent.api_mode == "chat_completions":
+                            api_kwargs["tool_choice"] = {
+                                "type": "function",
+                                "function": {"name": _forced_terminal_tool},
+                            }
+                            _forced_scope = terminal_tool_request_scope(
+                                messages=api_kwargs.get("messages") or [],
+                                required_tool=_forced_terminal_tool,
+                            )
+                            api_kwargs["tools"] = [
+                                tool
+                                for tool in (api_kwargs.get("tools") or [])
+                                if str(
+                                    (tool.get("function") or {}).get("name")
+                                    or tool.get("name")
+                                    or ""
+                                )
+                                in _forced_scope
+                            ]
+                        logger.warning(
+                            "forcing required terminal tool after repeated "
+                            "misdirection: %s (request tools=%d)",
+                            _forced_terminal_tool,
+                            len(api_kwargs.get("tools") or []),
+                        )
+                except Exception:
+                    logger.debug("terminal-tool force check failed", exc_info=True)
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
@@ -7833,11 +7889,54 @@ def run_conversation(
                     intent_ack_continuation_mode,
                 )
 
+                try:
+                    from agent.terminal_tool_guard import (
+                        build_required_terminal_tool_nudge,
+                    )
+
+                    _terminal_tool_nudge = build_required_terminal_tool_nudge(
+                        agent=agent,
+                        user_message=user_message,
+                        messages=messages,
+                        attempts=terminal_tool_guard_nudges,
+                        current_turn_user_idx=current_turn_user_idx,
+                    )
+                except Exception:
+                    logger.debug("terminal-tool stop-loop check failed", exc_info=True)
+                    _terminal_tool_nudge = None
+
+                if _terminal_tool_nudge:
+                    terminal_tool_guard_nudges += 1
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message, "terminal_tool_required"
+                    )
+                    interim_msg["_terminal_tool_guard_synthetic"] = True
+                    append_message(messages, interim_msg)
+                    append_message(
+                        messages,
+                        {
+                            "role": "user",
+                            "content": _terminal_tool_nudge,
+                            "_terminal_tool_guard_synthetic": True,
+                        },
+                    )
+                    agent._session_messages = messages
+                    logger.info(
+                        "terminal-tool stop-loop nudge issued (attempt %d)",
+                        terminal_tool_guard_nudges,
+                    )
+                    agent._emit_status(
+                        "⚠️ Required completion report is missing — continuing the task"
+                    )
+                    final_response = None
+                    continue
+
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
                     _ack_mode != "off"
                     and agent.valid_tool_names
-                    and codex_ack_continuations < 2
+                    and codex_ack_continuations
+                    < max(0, getattr(agent, "_intent_ack_max_continuations", 2))
                     and agent._looks_like_codex_intermediate_ack(
                         user_message=user_message,
                         assistant_content=final_response,

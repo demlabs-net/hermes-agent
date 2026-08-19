@@ -1514,6 +1514,11 @@ def get_config_path() -> Path:
 
 def get_skills_dir() -> Path:
     """Return the path to the skills directory under HERMES_HOME."""
+    from external_state import get_external_state_runtime
+
+    runtime = get_external_state_runtime()
+    if runtime is not None and runtime.enabled("skills"):
+        return runtime.get_skills_dir()
     return get_hermes_home() / "skills"
 
 

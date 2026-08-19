@@ -156,6 +156,17 @@ DEFAULT_CONFIG = {
         # api_modes — fixes the Gemini/Claude "stops after stating intent" case),
         # false (never), or a list of model-name substrings to match.
         "intent_ack_continuation": "auto",
+        "intent_ack_max_continuations": 2,
+        # Maximum assistant-text length inspected by the intent-ack detector;
+        # 0 removes the ceiling.
+        "intent_ack_max_chars": 1200,
+        # Optional terminal-tool completion contract for delegated/API runs.
+        "required_terminal_tools": [],
+        "required_terminal_tool_platforms": [],
+        "required_terminal_tool_user_pattern": "",
+        "required_terminal_tool_max_nudges": 2,
+        "required_terminal_tool_force_after_searches": 2,
+        "required_terminal_tool_nudge": "",
         # Universal "finish the job" guidance — short prompt block applied to
         # all models that targets two cross-family failure modes: (1) stopping
         # after a stub instead of finishing the artifact, (2) fabricating
@@ -1816,6 +1827,25 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+    },
+
+    # Optional authoritative storage for built-in MEMORY.md/USER.md and the
+    # writable skills tree. Existing code works against an ephemeral cache;
+    # only the external backend is durable. "module:factory" backends may be
+    # supplied in addition to the built-in standard MCP driver.
+    "external_state": {
+        "backend": "",  # "mcp" or "package.module:factory"
+        "strict": True,
+        "mcp": {
+            "url": "",
+            "url_env": "",
+            "headers": {},
+            "header_env": {},
+            "bearer_token_env": "",
+            "timeout_seconds": 20,
+        },
+        "memory": {"enabled": False, "namespace": "hermes-memory"},
+        "skills": {"enabled": False, "namespace": "hermes-skills"},
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

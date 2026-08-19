@@ -169,7 +169,9 @@ def _skills_dir() -> Path:
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
-    return get_hermes_home() / "skills"
+    from hermes_constants import get_skills_dir
+
+    return get_skills_dir()
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
@@ -1575,6 +1577,33 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
+    # In external-state mode, operator-mounted skill directories are immutable
+    # inputs. Only the profile's externally backed writable tree may be
+    # mutated; otherwise an edit would succeed in a deployment directory while
+    # bypassing the configured durable backend.
+    try:
+        from external_state import get_external_state_runtime
+
+        _external_runtime = get_external_state_runtime()
+        if (
+            _external_runtime is not None
+            and _external_runtime.enabled("skills")
+            and action != "create"
+        ):
+            _existing_external = _find_skill(name)
+            if _existing_external is not None:
+                _external_root = _external_runtime.get_skills_dir().resolve()
+                try:
+                    Path(_existing_external["path"]).resolve().relative_to(_external_root)
+                except ValueError:
+                    return tool_error(
+                        "This skill is operator-mounted and read-only. Create a new "
+                        "externally persisted skill instead of modifying deployment guidance.",
+                        success=False,
+                    )
+    except Exception as exc:
+        return tool_error(f"External skill state is unavailable: {exc}", success=False)
+
     # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the
     # skill directory so every mutation — any actor — lands in the append-only
     # JSONL ledger with before/after blobs. Telemetry, not a gate: failures
@@ -1624,6 +1653,22 @@ def skill_manage(
 
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
+
+    if result.get("success"):
+        # When external skills are enabled the filesystem is only a
+        # process-scoped compatibility cache. Persist the complete changed
+        # skill directory (or its deletion) before reporting success.
+        try:
+            from external_state import get_external_state_runtime
+
+            runtime = get_external_state_runtime()
+            if runtime is not None and runtime.enabled("skills"):
+                runtime.sync_tree("skills", runtime.get_skills_dir())
+        except Exception as exc:
+            result = {
+                "success": False,
+                "error": f"External skill persistence failed: {exc}",
+            }
 
     if result.get("success"):
         # Audit ledger append (best-effort; never blocks the mutation).

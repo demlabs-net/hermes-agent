@@ -52,6 +52,11 @@ logger = logging.getLogger(__name__)
 # happened after the first import.
 def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
+    from external_state import get_external_state_runtime
+
+    runtime = get_external_state_runtime()
+    if runtime is not None and runtime.enabled("memory"):
+        return runtime.get_memory_dir()
     return get_hermes_home() / "memories"
 
 # Stable header prefixes for the system-prompt memory blocks rendered by
@@ -363,7 +368,13 @@ class MemoryStore:
     def save_to_disk(self, target: str):
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        path = self._path_for(target)
+        self._write_file(path, self._entries_for(target))
+        from external_state import get_external_state_runtime
+
+        runtime = get_external_state_runtime()
+        if runtime is not None and runtime.enabled("memory"):
+            runtime.sync_file("memory", path)
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -1261,7 +1272,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
 
 
