@@ -6167,11 +6167,14 @@ def run_conversation(
                         api_error, retry_count=retry_count, max_retries=max_retries,
                     ):
                         _retry.primary_recovery_attempted = True
-                        retry_count = 0
-                        # Primary transport recovery starts a fresh attempt
-                        # cycle. Re-open fallback state so a follow-on 429 can
-                        # still activate fallback_providers after stale
-                        # pre-recovery fallback/credential-pool bookkeeping.
+                        # The transport was rebuilt for one final probe, not a
+                        # second full retry cycle. Resetting this to zero made
+                        # a nominal three-attempt policy perform six physical
+                        # requests when every request stalled before headers.
+                        retry_count = max(0, max_retries - 1)
+                        # Re-open fallback state so a follow-on 429 can still
+                        # activate fallback_providers after stale pre-recovery
+                        # fallback/credential-pool bookkeeping.
                         _retry.has_retried_429 = False
                         agent._fallback_index = 0
                         agent._fallback_activated = False
