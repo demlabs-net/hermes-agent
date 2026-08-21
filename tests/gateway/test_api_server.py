@@ -266,6 +266,20 @@ class TestConcurrencyCap:
         with patch("hermes_cli.config.load_config", return_value=cfg):
             assert APIServerAdapter._resolve_max_concurrent_runs() == 3
 
+    def test_resolve_run_completion_reaping_from_config(self):
+        cfg = {
+            "gateway": {
+                "api_server": {
+                    "reap_background_processes_on_run_completion": True,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            assert (
+                APIServerAdapter._resolve_reap_background_processes_on_run_completion()
+                is True
+            )
+
 
     def test_under_cap_returns_none(self):
         adapter = _make_adapter()
@@ -520,6 +534,49 @@ class TestDisconnectedAgentReap:
         assert calls == [True]
         _clear_turn_process_ownership(run_b)
 
+    def test_unique_run_session_keys_do_not_supersede_each_other(self, monkeypatch):
+        """Concurrent /v1/runs may share a conversation task id, but each
+        approval/session key owns an independent process namespace."""
+        from gateway.platforms.api_server import (
+            _clear_turn_process_ownership,
+            _publish_turn_process_ownership,
+            _reap_disconnected_agent_processes,
+        )
+        from tools.process_registry import process_registry
+
+        calls = []
+        monkeypatch.setattr(
+            process_registry,
+            "snapshot_running_ids",
+            lambda _task_id, *, session_key="": frozenset({f"pre-{session_key}"}),
+        )
+        monkeypatch.setattr(
+            process_registry,
+            "kill_started_since",
+            lambda task_id, baseline, *, source, session_key="": calls.append(
+                (task_id, baseline, session_key)
+            )
+            or 1,
+        )
+
+        run_a = types.SimpleNamespace()
+        run_b = types.SimpleNamespace()
+        _publish_turn_process_ownership(run_a, "shared-task", session_key="run-a")
+        _publish_turn_process_ownership(run_b, "shared-task", session_key="run-b")
+
+        _reap_disconnected_agent_processes(run_a)
+        _reap_disconnected_agent_processes(run_b)
+        deadline = time.time() + 1.0
+        while len(calls) < 2 and time.time() < deadline:
+            time.sleep(0.01)
+
+        assert sorted(calls) == [
+            ("shared-task", frozenset({"pre-run-a"}), "run-a"),
+            ("shared-task", frozenset({"pre-run-b"}), "run-b"),
+        ]
+        _clear_turn_process_ownership(run_a)
+        _clear_turn_process_ownership(run_b)
+
     def test_reap_proceeds_when_own_clear_pruned_the_epoch_entry(self, monkeypatch):
         """A missing epoch entry (the abandoned run's own finally already
         cleared it) means no newer claimant — the reap must proceed using a
@@ -583,6 +640,7 @@ class TestDisconnectedAgentReap:
         assert agent._gateway_turn_process_task_id == ""
         assert agent._gateway_turn_process_baseline == frozenset()
         assert agent._gateway_turn_process_epoch is None
+        assert agent._gateway_turn_process_epoch_key == ""
         # Entry pruned — dict stays bounded to in-flight runs.
         assert "sess-rt" not in _TURN_PROCESS_EPOCHS
 

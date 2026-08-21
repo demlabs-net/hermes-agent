@@ -148,6 +148,60 @@ class TestStartRun:
                 assert status["object"] == "hermes.run"
 
     @pytest.mark.asyncio
+    async def test_opt_in_reaps_run_owned_background_processes(self, adapter, monkeypatch):
+        """A task-runner policy cleans up session-owned local previews."""
+        from tools.process_registry import process_registry
+
+        adapter._reap_background_processes_on_run_completion = True
+        snapshots = []
+        reaps = []
+        monkeypatch.setattr(
+            process_registry,
+            "snapshot_running_ids",
+            lambda task_id, *, session_key="": snapshots.append(
+                (task_id, session_key)
+            )
+            or frozenset({"proc-before"}),
+        )
+        monkeypatch.setattr(
+            process_registry,
+            "kill_started_since",
+            lambda task_id, baseline, *, source, session_key="": reaps.append(
+                (task_id, baseline, source, session_key)
+            )
+            or 1,
+        )
+
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "done"
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    if reaps:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert snapshots == [(run_id, run_id)]
+        assert reaps == [
+            (
+                run_id,
+                frozenset({"proc-before"}),
+                "api_server_run_completion",
+                run_id,
+            )
+        ]
+
+    @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async

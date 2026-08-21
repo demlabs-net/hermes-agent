@@ -2432,19 +2432,31 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
-        """Capture running process IDs owned by ``task_id``.
+    def snapshot_running_ids(
+        self,
+        task_id: str,
+        *,
+        session_key: str = "",
+    ) -> frozenset[str]:
+        """Capture running process IDs owned by a gateway session or task.
 
         Gateway turns use this as a boundary marker: if a turn times out, only
         processes absent from its starting snapshot belong to the abandoned
         turn. Older session processes must survive because background tasks
-        intentionally span successful turns.
+        intentionally span successful turns. ``session_key`` covers local
+        terminal environments whose process ``task_id`` is deliberately
+        collapsed to ``default`` while retaining the gateway run identity.
         """
+        def is_owned(session: ProcessSession) -> bool:
+            if session_key:
+                return session.session_key == session_key
+            return session.task_id == task_id
+
         with self._lock:
             return frozenset(
                 s.id
                 for s in self._running.values()
-                if s.task_id == task_id and not s.exited
+                if is_owned(s) and not s.exited
             )
 
     def kill_started_since(
@@ -2453,8 +2465,9 @@ class ProcessRegistry:
         baseline_ids,
         *,
         source: str,
+        session_key: str = "",
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot.
+        """Kill processes created for one session/task after a snapshot.
 
         ``consume_output`` is forced on: abandoned-turn output must not
         enqueue a synthetic follow-up that revives work the timeout
@@ -2465,6 +2478,7 @@ class ProcessRegistry:
             exclude_ids=frozenset(baseline_ids or ()),
             source=source,
             consume_output=True,
+            session_key=session_key,
         )
 
     def kill_all(
@@ -2474,13 +2488,27 @@ class ProcessRegistry:
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
+        session_key: str = "",
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill processes for a session, a task, or all processes.
+
+        A non-empty ``session_key`` is the authoritative owner selector. This
+        prevents concurrent API runs that share a conversation ``task_id``
+        from killing each other's work. ``task_id`` remains the fallback for
+        callers without a gateway session; omitting both preserves the legacy
+        kill-all behavior.
+        """
+        def is_owned(session: ProcessSession) -> bool:
+            if session_key:
+                return session.session_key == session_key
+            if task_id is not None:
+                return session.task_id == task_id
+            return True
+
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id)
-                and s.id not in exclude_ids
+                if is_owned(s) and s.id not in exclude_ids
                 and not s.exited
             ]
 

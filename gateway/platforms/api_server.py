@@ -704,23 +704,31 @@ def _reap_disconnected_agent_processes(
     the same baseline-diff reap. Fire-and-forget on a daemon thread so the
     SSE handler's own cleanup isn't blocked on process-tree teardown.
 
-    Reaping is epoch-gated: client-provided session IDs are conversation
-    scopes, and multiple concurrent runs can intentionally share one (see
-    ``_handle_runs``). Without the gate, run A disconnecting could kill a
-    process a still-live run B (same task_id) spawned after A's baseline
-    snapshot — the same stale-reaper bug class the gateway path gates via
-    ``run_generation``. The epoch closure skips the reap when a newer run
-    has since claimed the task_id; that newer run's own baseline covers its
+    Reaping is epoch-gated by the process ownership key: a unique API-run
+    session key when available, otherwise the conversation task ID. Without
+    the fallback gate, run A disconnecting could kill a process a still-live
+    run B spawned after A's baseline when both share one process namespace —
+    the same stale-reaper bug class the gateway path gates via
+    ``run_generation``. The epoch closure skips the reap when a newer run has
+    since claimed that namespace; the newer run's own baseline covers its
     eventual cleanup.
     """
     process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+    process_session_key = getattr(
+        agent, "_gateway_turn_process_session_key", ""
+    )
+    process_epoch_key = getattr(
+        agent,
+        "_gateway_turn_process_epoch_key",
+        process_session_key or process_task_id,
+    )
     process_baseline = getattr(agent, "_gateway_turn_process_baseline", None)
     if not process_task_id or process_baseline is None:
         return
     epoch = getattr(agent, "_gateway_turn_process_epoch", None)
     is_still_current: Optional[Any] = None
     if epoch is not None:
-        def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
+        def _epoch_still_current(_epoch_key=process_epoch_key, _epoch=epoch):
             # Skip only when a NEWER run has claimed this task_id. A missing
             # entry means the abandoned run's own clear pruned it (worker
             # returned after the interrupt) — no newer claimant exists, so
@@ -728,7 +736,7 @@ def _reap_disconnected_agent_processes(
             # the gateway gate's semantics: worker completion does not bump
             # run_generation either.
             with _TURN_PROCESS_EPOCH_LOCK:
-                current = _TURN_PROCESS_EPOCHS.get(_task_id)
+                current = _TURN_PROCESS_EPOCHS.get(_epoch_key)
             return current is None or current == _epoch
 
         is_still_current = _epoch_still_current
@@ -738,26 +746,35 @@ def _reap_disconnected_agent_processes(
     threading.Thread(
         target=_reap_gateway_turn_processes,
         args=(process_task_id, process_baseline),
-        kwargs={"source": source, "is_still_current": is_still_current},
+        kwargs={
+            "source": source,
+            "session_key": process_session_key,
+            "is_still_current": is_still_current,
+        },
         name=f"api-turn-reaper-{process_task_id[:12]}",
         daemon=True,
     ).start()
 
 
-# Per-task-id run epochs for the reap gate above. task_id is a conversation
-# scope shared by concurrent API runs, so each run that claims it bumps the
-# epoch; a reaper holding a stale epoch declines to kill. Epochs come from a
-# single monotonic counter (never reused), so pruning an entry and later
-# re-claiming the task_id can never resurrect a stale reaper's claim.
-# Entries are pruned on clear when still current, bounding the dict to
-# in-flight runs.
+# Per-owner run epochs for the reap gate above. A unique process session key is
+# preferred; task_id is the fallback for clients that share the task namespace.
+# Each run that claims one owner key bumps the epoch, so a reaper holding a
+# stale epoch declines to kill. Epochs come from a single monotonic counter
+# (never reused), so pruning and later re-claiming a key cannot resurrect a
+# stale reaper's claim. Entries are pruned on clear when still current,
+# bounding the dict to in-flight runs.
 _TURN_PROCESS_EPOCHS: Dict[str, int] = {}
 _TURN_PROCESS_EPOCH_LOCK = threading.Lock()
 _TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
 
 
-def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
-    """Snapshot the process baseline and claim the task_id's current epoch.
+def _publish_turn_process_ownership(
+    agent: Any,
+    task_id: str,
+    *,
+    session_key: str = "",
+) -> None:
+    """Snapshot the process baseline and claim its ownership epoch.
 
     Single place all API-server agent lifecycles (chat/responses ``_run_agent``
     and ``/v1/runs``) record turn ownership, so the marker attribute names and
@@ -765,13 +782,21 @@ def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
     """
     from tools.process_registry import process_registry
 
+    epoch_key = session_key or task_id
     with _TURN_PROCESS_EPOCH_LOCK:
         epoch = next(_TURN_PROCESS_EPOCH_COUNTER)
-        _TURN_PROCESS_EPOCHS[task_id] = epoch
+        _TURN_PROCESS_EPOCHS[epoch_key] = epoch
     agent._gateway_turn_process_task_id = task_id
-    agent._gateway_turn_process_baseline = process_registry.snapshot_running_ids(
-        task_id
-    )
+    agent._gateway_turn_process_session_key = session_key
+    agent._gateway_turn_process_epoch_key = epoch_key
+    if session_key:
+        process_baseline = process_registry.snapshot_running_ids(
+            task_id,
+            session_key=session_key,
+        )
+    else:
+        process_baseline = process_registry.snapshot_running_ids(task_id)
+    agent._gateway_turn_process_baseline = process_baseline
     agent._gateway_turn_process_epoch = epoch
 
 
@@ -783,14 +808,17 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     guard in ``gateway/run.py``'s ``_run_sync_with_timeout_lifecycle``.
     """
     task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+    epoch_key = getattr(agent, "_gateway_turn_process_epoch_key", task_id)
     epoch = getattr(agent, "_gateway_turn_process_epoch", None)
-    if task_id and epoch is not None:
+    if epoch_key and epoch is not None:
         with _TURN_PROCESS_EPOCH_LOCK:
             # Prune only when this run is still the current claimant; a
             # newer concurrent run owns the entry otherwise.
-            if _TURN_PROCESS_EPOCHS.get(task_id) == epoch:
-                del _TURN_PROCESS_EPOCHS[task_id]
+            if _TURN_PROCESS_EPOCHS.get(epoch_key) == epoch:
+                del _TURN_PROCESS_EPOCHS[epoch_key]
     agent._gateway_turn_process_task_id = ""
+    agent._gateway_turn_process_session_key = ""
+    agent._gateway_turn_process_epoch_key = ""
     agent._gateway_turn_process_baseline = frozenset()
     agent._gateway_turn_process_epoch = None
 
@@ -1454,6 +1482,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # the cap. Bounds CPU / memory / upstream-LLM-quota exhaustion
         # from a request flood (#7483).
         self._max_concurrent_runs: int = self._resolve_max_concurrent_runs()
+        self._reap_background_processes_on_run_completion: bool = (
+            self._resolve_reap_background_processes_on_run_completion()
+        )
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
@@ -1643,6 +1674,23 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return default
         return max(0, value)
+
+    @staticmethod
+    def _resolve_reap_background_processes_on_run_completion() -> bool:
+        """Read the opt-in terminal-process policy for ``/v1/runs``."""
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            raw = cfg_get(
+                load_config(),
+                "gateway",
+                "api_server",
+                "reap_background_processes_on_run_completion",
+                default=False,
+            )
+        except Exception:
+            return False
+        return _coerce_request_bool(raw, default=False)
 
     @staticmethod
     def _resolve_model_name(explicit: str) -> str:
@@ -6402,7 +6450,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     # gateway-turn cleanup (#76115); this API-server surface
                     # runs its own agent lifecycle and doesn't go through
                     # TurnRunner, so it needs its own baseline.
-                    _publish_turn_process_ownership(agent, effective_task_id)
+                    _publish_turn_process_ownership(
+                        agent,
+                        effective_task_id,
+                        session_key=gateway_session_key or session_id or "",
+                    )
                     # Shutdown interrupt coverage (#63529).  Registering here,
                     # once, covers every _run_agent() caller — the same reason
                     # the _ProviderAuthResolutionError handler below lives here
@@ -6902,18 +6954,30 @@ class APIServerAdapter(BasePlatformAdapter):
                             # TurnRunner, no _run_agent) — record turn process
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
-                            _publish_turn_process_ownership(agent, effective_task_id)
+                            _publish_turn_process_ownership(
+                                agent,
+                                effective_task_id,
+                                session_key=approval_session_key,
+                            )
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                             )
                         finally:
-                            # Worker finished (interrupted or complete) —
-                            # clear turn ownership immediately so a later
-                            # stop/cancel can't reap background work this
-                            # run deliberately left running (same race-window
-                            # guard as gateway/run.py and _run_agent above).
+                            # A stateless task runner can opt into treating all
+                            # background work created during /v1/runs as
+                            # run-owned scratch state. Reap before clearing the
+                            # ownership markers; the detached worker receives
+                            # its own immutable snapshot and epoch gate.
+                            if self._reap_background_processes_on_run_completion:
+                                _reap_disconnected_agent_processes(
+                                    agent,
+                                    source="api_server_run_completion",
+                                )
+                            # Clear ownership immediately so a later stop or
+                            # disconnect cannot claim processes from a future
+                            # run that reuses the conversation scope.
                             _clear_turn_process_ownership(agent)
                             try:
                                 unregister_gateway_notify(approval_session_key)

@@ -2997,6 +2997,12 @@ DEFAULT_CONFIG = {
             # bounding CPU / memory / upstream-LLM-quota exhaustion from a
             # request flood. Set to 0 to disable the cap entirely.
             "max_concurrent_runs": 10,
+            # Stateless task runners may opt in to treating background
+            # processes as run-owned scratch work. When enabled, processes
+            # created by /v1/runs are reaped as that run reaches a terminal
+            # state. Disabled by default because generic API clients may
+            # intentionally launch work that outlives one request.
+            "reap_background_processes_on_run_completion": False,
         },
     },
 

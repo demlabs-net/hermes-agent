@@ -3105,6 +3105,7 @@ def _reap_gateway_turn_processes(
     process_baseline,
     *,
     source: str,
+    session_key: str = "",
     is_still_current: Optional[Callable[[], bool]] = None,
 ) -> int:
     """Reap only background processes created by one abandoned turn.
@@ -3144,10 +3145,13 @@ def _reap_gateway_turn_processes(
     from tools.process_registry import process_registry
 
     try:
+        reap_options = {"source": source}
+        if session_key:
+            reap_options["session_key"] = session_key
         killed = process_registry.kill_started_since(
             task_id,
             process_baseline,
-            source=source,
+            **reap_options,
         )
     except Exception:
         # Runs on a detached daemon thread (interrupt and timeout call

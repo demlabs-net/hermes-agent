@@ -571,6 +571,9 @@ gateway:
     cors_origins: http://localhost:3000
     model_name: my-hermes
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit
+    # For bounded task runners only: stop background terminal processes made
+    # by a /v1/runs request when that run completes or fails.
+    reap_background_processes_on_run_completion: false
 ```
 
 `port`, `key`, `host`, `cors_origins`, and `model_name` are automatically bridged into the platform's `extra` settings, so they behave exactly like their `API_SERVER_*` environment-variable counterparts. Environment variables take precedence over `config.yaml` values. The block is also accepted under `gateway.platforms.api_server:` or a top-level `platforms.api_server:` section.
@@ -578,6 +581,16 @@ gateway:
 ### Concurrent-run cap
 
 The API server limits how many agent runs may execute at once across the OpenAI-compatible and Runs endpoints. The cap is read from `gateway.api_server.max_concurrent_runs` (default **10**; `0` disables the limit, negative values clamp to 0). When the cap is reached, new run-starting requests are rejected with **HTTP 429** `Too many concurrent runs (max N)` — clients should back off and retry.
+
+### Bounded-run process cleanup
+
+`gateway.api_server.reap_background_processes_on_run_completion` defaults to
+`false`. Enable it only when `/v1/runs` represents bounded jobs whose preview
+servers, watchers, and other background terminal commands must not outlive the
+job. Cleanup is scoped to processes created after that run's baseline and
+matches its unique gateway session key, so local terminal environments that
+share an internal `task_id` remain isolated from concurrent runs. The ordinary
+chat and Responses endpoints are unaffected.
 
 ## Security Headers
 

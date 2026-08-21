@@ -49,12 +49,14 @@ def _make_session(
     exit_code=None,
     output="",
     started_at=None,
+    session_key="",
 ) -> ProcessSession:
     """Helper to create a ProcessSession for testing."""
     s = ProcessSession(
         id=sid,
         command=command,
         task_id=task_id,
+        session_key=session_key,
         started_at=started_at or time.time(),
         exited=exited,
         exit_code=exit_code,
@@ -101,6 +103,61 @@ def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry
             "proc_new",
             {
                 "source": "gateway_turn_timeout",
+                "consume_output": True,
+            },
+        )
+    ]
+
+
+def test_kill_started_since_matches_collapsed_task_by_session_key(registry):
+    """Gateway runs retain ownership when local envs collapse task_id."""
+    old = _make_session(
+        sid="proc_old",
+        task_id="default",
+        session_key="run-a",
+    )
+    registry._running[old.id] = old
+    baseline = registry.snapshot_running_ids("task-a", session_key="run-a")
+
+    owned = _make_session(
+        sid="proc_owned",
+        task_id="default",
+        session_key="run-a",
+    )
+    foreign = _make_session(
+        sid="proc_foreign",
+        task_id="default",
+        session_key="run-b",
+    )
+    shared_task_foreign_session = _make_session(
+        sid="proc_shared_task_foreign_session",
+        task_id="task-a",
+        session_key="run-b",
+    )
+    registry._running[owned.id] = owned
+    registry._running[foreign.id] = foreign
+    registry._running[shared_task_foreign_session.id] = shared_task_foreign_session
+
+    calls = []
+
+    def fake_kill(session_id, **kwargs):
+        calls.append((session_id, kwargs))
+        return {"status": "killed"}
+
+    registry.kill_process = fake_kill
+
+    assert baseline == frozenset({"proc_old"})
+    assert registry.kill_started_since(
+        "task-a",
+        baseline,
+        source="api_server_run_completion",
+        session_key="run-a",
+    ) == 1
+    assert calls == [
+        (
+            "proc_owned",
+            {
+                "source": "api_server_run_completion",
                 "consume_output": True,
             },
         )
