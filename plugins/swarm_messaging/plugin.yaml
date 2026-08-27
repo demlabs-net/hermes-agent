@@ -1,0 +1,10 @@
+name: swarm_messaging
+version: 1.0.0
+description: "Exposes the built-in send_message engine as an agent-callable tool so swarm agents can post to the shared Telegram home channel and address teammates by @mention. Explicit operator opt-in (allow_tool_override) that re-registers Hermes' internal cross-channel send engine for model use."
+author: DemLabs
+kind: standalone
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - send_message

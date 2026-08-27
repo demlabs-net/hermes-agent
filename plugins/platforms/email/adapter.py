@@ -551,6 +551,7 @@ class EmailAdapter(BasePlatformAdapter):
         # instead of an obvious "host not set" error.
         extra = config.extra or {}
         self._address = (_get_secret("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
+        self._from_name = (_get_secret("EMAIL_FROM_NAME", "") or extra.get("from_name", "")).strip()
         self._password = _get_secret("EMAIL_PASSWORD", "")
         self._imap_host = (_get_secret("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
         self._imap_port = _esecret_int("EMAIL_IMAP_PORT", 993)
@@ -1163,7 +1164,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email via SMTP. Runs in executor thread."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = f"{self._from_name} <{self._address}>" if self._from_name else self._address
         msg["To"] = to_addr
 
         # Thread context for reply
@@ -1278,7 +1279,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = f"{self._from_name} <{self._address}>" if self._from_name else self._address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
@@ -1358,7 +1359,7 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
-        msg["From"] = self._address
+        msg["From"] = f"{self._from_name} <{self._address}>" if self._from_name else self._address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
