@@ -460,6 +460,20 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
+    def test_scoped_deferred_probe_does_not_publish_process_global(self):
+        import model_tools
+
+        self._register("mcp_helper_probe", "mcp-helper-probe")
+        sentinel = ["execute_code", "terminal"]
+        model_tools._last_resolved_tool_names = list(sentinel)
+
+        names = model_tools.get_scoped_deferred_tool_names(
+            enabled_toolsets=["mcp-helper-probe"]
+        )
+
+        assert names == frozenset({"mcp_helper_probe"})
+        assert model_tools._last_resolved_tool_names == sentinel
+
 
 # ---------------------------------------------------------------------------
 # Catalog listing (skills-style progressive disclosure)

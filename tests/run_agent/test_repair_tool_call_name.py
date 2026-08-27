@@ -11,6 +11,7 @@ falls back to fuzzy match.
 """
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -75,6 +76,75 @@ class TestEdgeCases:
 
     def test_empty_string(self, repair):
         assert repair("") is None
+
+    def test_registered_but_hidden_tool_is_not_fuzzy_mapped(self, monkeypatch):
+        """A deferred read must never become a similarly named mutation."""
+        from agent.agent_runtime_helpers import repair_tool_call
+        from tools.registry import registry
+
+        hidden = "mcp__bridge_regression__read_resource"
+        visible = "mcp__bridge_regression__order"
+        original_get_entry = registry.get_entry
+        monkeypatch.setattr(
+            registry,
+            "get_entry",
+            lambda name: object() if name == hidden else original_get_entry(name),
+        )
+        agent = SimpleNamespace(valid_tool_names={visible})
+
+        assert repair_tool_call(agent, hidden) is None
+
+
+class TestDeferredToolBridge:
+    def test_exact_scoped_call_is_wrapped_with_original_arguments(self, monkeypatch):
+        from agent.agent_runtime_helpers import bridge_deferred_tool_call
+        import model_tools
+
+        name = "mcp__swarm__read_resource"
+        monkeypatch.setattr(
+            model_tools,
+            "get_scoped_deferred_tool_names",
+            lambda **_kwargs: frozenset({name}),
+        )
+        agent = SimpleNamespace(
+            valid_tool_names={"tool_call"},
+            enabled_toolsets=["mcp-swarm"],
+            disabled_toolsets=None,
+        )
+        call = SimpleNamespace(
+            function=SimpleNamespace(
+                name=name,
+                arguments='{"uri":"swarm://operations"}',
+            )
+        )
+
+        assert bridge_deferred_tool_call(agent, call) == name
+        assert call.function.name == "tool_call"
+        assert json.loads(call.function.arguments) == {
+            "name": name,
+            "arguments": {"uri": "swarm://operations"},
+        }
+
+    def test_out_of_scope_call_is_not_wrapped(self, monkeypatch):
+        from agent.agent_runtime_helpers import bridge_deferred_tool_call
+        import model_tools
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_scoped_deferred_tool_names",
+            lambda **_kwargs: frozenset(),
+        )
+        agent = SimpleNamespace(
+            valid_tool_names={"tool_call"},
+            enabled_toolsets=["safe"],
+            disabled_toolsets=None,
+        )
+        call = SimpleNamespace(
+            function=SimpleNamespace(name="mcp__swarm__order", arguments="{}")
+        )
+
+        assert bridge_deferred_tool_call(agent, call) is None
+        assert call.function.name == "mcp__swarm__order"
 
 
 

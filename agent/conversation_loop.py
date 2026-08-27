@@ -6865,6 +6865,15 @@ def run_conversation(
                 # Repair mismatched tool names before validating
                 for tc in assistant_message.tool_calls:
                     if tc.function.name not in agent.valid_tool_names:
+                        from agent.agent_runtime_helpers import bridge_deferred_tool_call
+
+                        bridged_name = bridge_deferred_tool_call(agent, tc)
+                        if bridged_name:
+                            print(
+                                f"{agent.log_prefix}🔧 Auto-bridged deferred tool: "
+                                f"'{bridged_name}' -> 'tool_call'"
+                            )
+                            continue
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")

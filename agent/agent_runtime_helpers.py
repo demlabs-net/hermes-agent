@@ -3292,6 +3292,58 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
 
 
 
+def bridge_deferred_tool_call(agent, tool_call: Any) -> str | None:
+    """Wrap an exact, in-scope deferred call in the ``tool_call`` bridge.
+
+    Progressive disclosure hides MCP/plugin schemas behind ``tool_call``, but
+    models sometimes copy an exact tool name from the embedded catalog and
+    invoke it directly. Treating that name as a typo is dangerous: fuzzy
+    repair can turn a read into an unrelated mutating tool. This helper keeps
+    the original arguments, enforces the session's toolset scope, and lets the
+    normal bridge path perform schema probing, hooks, approvals, and dispatch.
+
+    Returns the original deferred name when wrapped, otherwise ``None``.
+    """
+    function = getattr(tool_call, "function", None)
+    tool_name = getattr(function, "name", "")
+    if not tool_name or "tool_call" not in getattr(agent, "valid_tool_names", set()):
+        return None
+
+    try:
+        from model_tools import get_scoped_deferred_tool_names
+
+        scoped_names = get_scoped_deferred_tool_names(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        )
+    except Exception:
+        logger.debug("Deferred tool scope lookup failed", exc_info=True)
+        return None
+    if tool_name not in scoped_names:
+        return None
+
+    raw_arguments = getattr(function, "arguments", None)
+    if isinstance(raw_arguments, dict):
+        arguments = raw_arguments
+    elif isinstance(raw_arguments, str):
+        try:
+            arguments = json.loads(raw_arguments or "{}")
+        except (TypeError, ValueError):
+            return None
+    else:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+
+    function.name = "tool_call"
+    function.arguments = json.dumps(
+        {"name": tool_name, "arguments": arguments},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return tool_name
+
+
 def repair_tool_call(agent, tool_name: str) -> str | None:
     """Attempt to repair a mismatched tool name before aborting.
 
@@ -3306,7 +3358,9 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
        Claude-style models sometimes tack on (TodoTool_tool ->
        TodoTool -> Todo -> todo). Applied twice so double-tacked
        suffixes like ``TodoTool_tool`` reduce all the way.
-    5. Fuzzy match (difflib, cutoff=0.7).
+    5. Refuse fuzzy repair when the cleaned name is an exact registered tool
+       that is merely unavailable or deferred in this session.
+    6. Fuzzy match (difflib, cutoff=0.7).
 
     See #14784 for the original reports (TodoTool_tool, Patch_tool,
     BrowserClick_tool were all returning "Unknown tool" before).
@@ -3377,6 +3431,19 @@ def repair_tool_call(agent, tool_name: str) -> str | None:
     for c in cands:
         if c and c in agent.valid_tool_names:
             return c
+
+    # An exact registry hit is not a typo. It may be deferred behind
+    # ``tool_call`` or excluded by this session's toolset ACL. In either case,
+    # mapping it to a similarly named visible tool can change semantics (for
+    # example read_resource -> order), so leave it for the invalid/deferred
+    # handling path instead of guessing.
+    try:
+        from tools.registry import registry
+
+        if registry.get_entry(tool_name) is not None:
+            return None
+    except Exception:
+        pass
 
     # Fuzzy match as last resort.
     matches = get_close_matches(lowered, agent.valid_tool_names, n=1, cutoff=0.7)
@@ -4364,6 +4431,7 @@ __all__ = [
     "create_openai_client",
     "switch_model",
     "invoke_tool",
+    "bridge_deferred_tool_call",
     "repair_tool_call",
     "sanitize_api_messages",
     "looks_like_codex_intermediate_ack",

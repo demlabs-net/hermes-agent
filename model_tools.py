@@ -419,8 +419,13 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    publish_resolved_names: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Uncached implementation of :func:`get_tool_definitions`."""
+    """Uncached implementation of :func:`get_tool_definitions`.
+
+    ``publish_resolved_names`` is false for scoped catalog probes that must
+    not overwrite the process-global execute-code compatibility snapshot.
+    """
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -599,8 +604,9 @@ def _compute_tool_definitions(
         else:
             print("🛠️  No tools selected (all filtered out or unavailable)")
 
-    global _last_resolved_tool_names
-    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    if publish_resolved_names:
+        global _last_resolved_tool_names
+        _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
 
     # Sanitize schemas for broad backend compatibility. llama.cpp's
     # json-schema-to-grammar converter (used by its OAI server to build
@@ -650,6 +656,30 @@ def _compute_tool_definitions(
         logger.warning("Tool search assembly skipped: %s", e)
 
     return filtered_tools
+
+
+def get_scoped_deferred_tool_names(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> frozenset[str]:
+    """Return deferred tools granted to one session without changing globals.
+
+    This is intentionally an uncached, exceptional-path lookup. It is used
+    when a model emits the exact name of a deferred tool instead of calling
+    the ``tool_call`` bridge. Recomputing the scoped pre-assembly catalog
+    preserves toolset ACLs, while suppressing publication prevents one
+    concurrent agent from replacing another agent's execute-code snapshot.
+    """
+    from tools.tool_search import scoped_deferrable_names
+
+    definitions = _compute_tool_definitions(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=True,
+        skip_tool_search_assembly=True,
+        publish_resolved_names=False,
+    )
+    return scoped_deferrable_names(definitions)
 
 
 def _resolve_active_context_length() -> int:
