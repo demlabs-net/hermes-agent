@@ -16,6 +16,7 @@ def agent(**overrides):
         "_required_terminal_tools": [REPORT],
         "_required_terminal_tool_platforms": ["api_server"],
         "_required_terminal_tool_user_pattern": r"^Task task_",
+        "_required_terminal_tool_result_pattern": "",
         "_required_terminal_tool_max_nudges": 4,
         "_required_terminal_tool_force_after_searches": 2,
         "_required_terminal_tool_nudge": "",
@@ -44,6 +45,49 @@ def test_successful_result_satisfies_contract_but_failure_does_not():
     assert nudge(base + [{"role": "tool", "name": REPORT, "content": '{"success":true}'}]) is None
     assert REPORT in nudge(
         base + [{"role": "tool", "name": REPORT, "content": '{"success":false}'}]
+    )
+
+
+def test_result_pattern_rejects_progress_and_accepts_terminal_status():
+    pattern = r'"status"\s*:\s*"(?:completed|blocked|failed)"'
+    base = [{"role": "user", "content": ORDER}]
+    in_progress = {
+        "role": "tool",
+        "name": REPORT,
+        "content": '{"result":{"ok":true,"status":"in_progress"}}',
+    }
+    completed = {
+        "role": "tool",
+        "name": REPORT,
+        "content": '{"result":{"ok":true,"status":"completed"}}',
+    }
+
+    assert REPORT in nudge(
+        base + [in_progress],
+        _required_terminal_tool_result_pattern=pattern,
+    )
+    assert nudge(
+        base + [in_progress, completed],
+        _required_terminal_tool_result_pattern=pattern,
+    ) is None
+
+
+def test_result_pattern_reads_structured_content_and_invalid_regex_fails_closed():
+    base = [{"role": "user", "content": ORDER}]
+    terminal = {
+        "role": "tool",
+        "name": REPORT,
+        "content": {"structuredContent": {"status": "blocked"}},
+    }
+    pattern = r'"status"\s*:\s*"(?:completed|blocked|failed)"'
+
+    assert nudge(
+        base + [terminal],
+        _required_terminal_tool_result_pattern=pattern,
+    ) is None
+    assert REPORT in nudge(
+        base + [terminal],
+        _required_terminal_tool_result_pattern="(",
     )
 
 

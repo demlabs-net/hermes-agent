@@ -26,6 +26,11 @@ def _as_names(value: Any) -> tuple[str, ...]:
 def _message_text(value: Any) -> str:
     if isinstance(value, str):
         return value
+    if isinstance(value, Mapping):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
@@ -35,6 +40,11 @@ def _message_text(value: Any) -> str:
                 text = item.get("text")
                 if isinstance(text, str):
                     parts.append(text)
+                else:
+                    try:
+                        parts.append(json.dumps(item, ensure_ascii=False))
+                    except (TypeError, ValueError):
+                        parts.append(str(item))
         return "\n".join(parts)
     return str(value or "")
 
@@ -62,17 +72,34 @@ def _tool_result_failed(message: Mapping[str, Any]) -> bool:
 
 
 def successful_terminal_tool(
-    *, messages: Sequence[Mapping[str, Any]], required_tools: Sequence[str]
+    *,
+    messages: Sequence[Mapping[str, Any]],
+    required_tools: Sequence[str],
+    result_pattern: str = "",
 ) -> Optional[str]:
-    """Return the required tool with a successful result, if any."""
+    """Return the required tool with a successful, semantically final result."""
 
     required = set(required_tools)
+    compiled_pattern: Optional[re.Pattern[str]] = None
+    if result_pattern:
+        try:
+            compiled_pattern = re.compile(result_pattern)
+        except re.error:
+            # A malformed completion contract must fail closed: accepting an
+            # arbitrary successful result can silently terminate delegated
+            # work before the external system reaches its terminal state.
+            return None
     for message in messages:
         if not isinstance(message, Mapping) or message.get("role") != "tool":
             continue
         name = str(message.get("name") or message.get("tool_name") or "").strip()
-        if name in required and not _tool_result_failed(message):
-            return name
+        if name not in required or _tool_result_failed(message):
+            continue
+        if compiled_pattern is not None and compiled_pattern.search(
+            _message_text(message.get("content"))
+        ) is None:
+            continue
+        return name
     return None
 
 
@@ -99,8 +126,13 @@ def _active_required_tools(
         except re.error:
             return (), 0
     start = max(0, min(int(current_turn_user_idx or 0), len(messages)))
+    result_pattern = str(
+        getattr(agent, "_required_terminal_tool_result_pattern", "") or ""
+    ).strip()
     if successful_terminal_tool(
-        messages=messages[start:], required_tools=required
+        messages=messages[start:],
+        required_tools=required,
+        result_pattern=result_pattern,
     ) is not None:
         return (), start
     return required, start

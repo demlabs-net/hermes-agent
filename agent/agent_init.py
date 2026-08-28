@@ -1929,6 +1929,9 @@ def init_agent(
     agent._required_terminal_tool_user_pattern = _agent_section.get(
         "required_terminal_tool_user_pattern", ""
     )
+    agent._required_terminal_tool_result_pattern = str(
+        _agent_section.get("required_terminal_tool_result_pattern", "") or ""
+    ).strip()
     try:
         agent._required_terminal_tool_max_nudges = max(
             0, int(_agent_section.get("required_terminal_tool_max_nudges", 2))

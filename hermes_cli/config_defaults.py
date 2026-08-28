@@ -164,6 +164,10 @@ DEFAULT_CONFIG = {
         "required_terminal_tools": [],
         "required_terminal_tool_platforms": [],
         "required_terminal_tool_user_pattern": "",
+        # Optional regex matched against a successful tool result. This lets
+        # integrations distinguish progress acknowledgements from genuinely
+        # terminal outcomes without coupling Hermes to a particular server.
+        "required_terminal_tool_result_pattern": "",
         "required_terminal_tool_max_nudges": 2,
         "required_terminal_tool_force_after_searches": 2,
         "required_terminal_tool_nudge": "",
