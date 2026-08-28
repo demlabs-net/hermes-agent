@@ -107,6 +107,82 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
     assert blocked.count == 2
 
 
+def test_successful_mutation_resets_prior_failure_streaks_before_revalidation():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_warn_after=2,
+            exact_failure_block_after=3,
+            same_tool_failure_warn_after=2,
+            same_tool_failure_halt_after=3,
+        )
+    )
+    render_args = {"command": "junior-render page.html evidence"}
+
+    for _ in range(2):
+        assert controller.before_call("terminal", render_args).action == "allow"
+        controller.after_call(
+            "terminal",
+            render_args,
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+
+    assert controller.after_call(
+        "patch",
+        {"path": "page.html", "old_string": "bad", "new_string": "fixed"},
+        json.dumps({"success": True}),
+        failed=False,
+    ).action == "allow"
+
+    # The same validation command is legitimate after the saved page changed.
+    assert controller.before_call("terminal", render_args).action == "allow"
+    decision = controller.after_call(
+        "terminal",
+        render_args,
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    assert decision.action == "allow"
+    assert decision.count == 1
+    assert controller.halt_decision is None
+
+
+def test_read_only_success_does_not_reset_same_tool_failure_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            exact_failure_block_after=99,
+            same_tool_failure_warn_after=2,
+            same_tool_failure_halt_after=3,
+        )
+    )
+
+    for index in range(2):
+        controller.after_call(
+            "terminal",
+            {"command": f"bad-{index}"},
+            json.dumps({"exit_code": 1}),
+            failed=True,
+        )
+    controller.after_call(
+        "read_file",
+        {"path": "page.html"},
+        "current contents",
+        failed=False,
+    )
+
+    decision = controller.after_call(
+        "terminal",
+        {"command": "bad-3"},
+        json.dumps({"exit_code": 1}),
+        failed=True,
+    )
+    assert decision.action == "halt"
+    assert decision.code == "same_tool_failure_halt"
+    assert decision.count == 3
+
+
 
 
 
@@ -167,7 +243,6 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
 
 
 

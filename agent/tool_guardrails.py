@@ -412,6 +412,16 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
+        # A successful mutation changes the preconditions for later checks.
+        # Retrying the same renderer/test/terminal command after an edit is a
+        # new validation attempt, not continuation of the earlier failure
+        # streak. Keep read-only successes from resetting the counters so a
+        # model cannot evade the circuit breaker by interleaving identical
+        # failures with harmless reads.
+        if self._is_mutating(tool_name):
+            self._exact_failure_counts.clear()
+            self._same_tool_failure_counts.clear()
+
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
@@ -440,9 +450,12 @@ class ToolCallGuardrailController:
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
     def _is_idempotent(self, tool_name: str) -> bool:
-        if tool_name in self.config.mutating_tools:
+        if self._is_mutating(tool_name):
             return False
         return tool_name in self.config.idempotent_tools
+
+    def _is_mutating(self, tool_name: str) -> bool:
+        return tool_name in self.config.mutating_tools
 
     def _check_loop_cap(
         self,
