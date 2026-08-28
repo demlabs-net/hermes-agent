@@ -145,6 +145,30 @@ class TestGenerateTitle:
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
+    def test_retries_once_without_unsupported_response_format(self):
+        unsupported = RuntimeError(
+            "HTTP 400: This response_format type is unavailable now"
+        )
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = '{"title":"Review visual regression"}'
+
+        with patch(
+            "agent.title_generator.call_llm",
+            side_effect=[unsupported, response],
+        ) as mock_llm:
+            assert generate_title("review the screenshots") == "Review visual regression"
+
+        assert mock_llm.call_count == 2
+        assert "extra_body" in mock_llm.call_args_list[0].kwargs
+        assert "extra_body" not in mock_llm.call_args_list[1].kwargs
+
+    def test_does_not_retry_unrelated_title_failure(self):
+        error = RuntimeError("HTTP 401: invalid API key")
+        with patch("agent.title_generator.call_llm", side_effect=error) as mock_llm:
+            assert generate_title("question") is None
+        mock_llm.assert_called_once()
+
 
 
 

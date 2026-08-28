@@ -338,6 +338,25 @@ def _clean_title(text: str) -> Optional[str]:
     return title
 
 
+def _response_format_is_unsupported(error: BaseException) -> bool:
+    """Return True only for provider rejections of structured title output."""
+    message = str(error).lower()
+    if "response_format" not in message and "response format" not in message:
+        return False
+    return any(
+        marker in message
+        for marker in (
+            "unavailable",
+            "unsupported",
+            "not supported",
+            "does not support",
+            "unknown parameter",
+            "unknown field",
+            "invalid parameter",
+        )
+    )
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -400,7 +419,7 @@ def generate_title(
     ]
 
     try:
-        response = call_llm(
+        call_kwargs = dict(
             task="title_generation",
             messages=messages,
             # A title is a handful of tokens. The old 500-token ceiling let a
@@ -411,6 +430,20 @@ def generate_title(
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
         )
+        try:
+            response = call_llm(**call_kwargs)
+        except Exception as structured_error:
+            if not _response_format_is_unsupported(structured_error):
+                raise
+            # Several otherwise OpenAI-compatible vision/reasoning endpoints
+            # reject response_format. The parser below already accepts loose
+            # JSON and first-line prose, so retry once without that optional
+            # capability instead of surfacing a noisy auxiliary failure.
+            logger.info(
+                "Title provider rejected response_format; retrying without structured output"
+            )
+            call_kwargs.pop("extra_body", None)
+            response = call_llm(**call_kwargs)
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
