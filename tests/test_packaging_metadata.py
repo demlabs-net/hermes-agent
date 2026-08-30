@@ -9,6 +9,19 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_external_state_is_packaged_as_a_top_level_module():
+    """The stage-2 skill sync runs outside the repository import root.
+
+    ``hermes_constants`` imports ``external_state`` while resolving the skills
+    directory. Editable installs therefore must expose that single-file module
+    explicitly; relying on the checkout as the current working directory makes
+    container startup fail before the gateway changes into the repository.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert "external_state" in data["tool"]["setuptools"]["py-modules"]
+
+
 def _distribution_name(requirement: str) -> str:
     """Extract the PEP 508 distribution name from a requirement string.
 
