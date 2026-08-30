@@ -3,9 +3,10 @@ transport and run_agent's iteration-limit summary path.
 
 LM Studio publishes per-model ``capabilities.reasoning.allowed_options`` (e.g.
 ``["off","on"]`` for toggle-style models, ``["off","minimal","low"]`` for
-graduated models). We map the user's ``reasoning_config`` onto LM Studio's
-OpenAI-compatible vocabulary, then clamp against the model's allowed set so
-the server doesn't 400 on an unsupported effort.
+graduated models). LM Studio's OpenAI-compatible endpoint still accepts its
+generic effort vocabulary rather than those literal toggle values. We map and
+clamp without sending a graded setting to a binary model, which would make LM
+Studio warn and silently fall back on every request.
 """
 
 from __future__ import annotations
@@ -17,7 +18,8 @@ from typing import List, Optional
 _LM_VALID_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
 # Toggle-style models publish allowed_options as ["off","on"] in /api/v1/models.
-# Map them onto the OpenAI-compatible request vocabulary.
+# Map them onto the OpenAI-compatible request vocabulary for graduated models;
+# the binary-only case is handled separately below.
 _LM_EFFORT_ALIASES = {"off": "none", "on": "medium"}
 
 # Hermes' generic effort ladder grew past LM Studio's vocabulary ("max",
@@ -54,7 +56,20 @@ def resolve_lmstudio_effort(
             if raw in _LM_VALID_EFFORTS:
                 effort = raw
     if allowed_options:
-        allowed = {_LM_EFFORT_ALIASES.get(opt, opt) for opt in allowed_options}
+        published = {
+            str(option).strip().lower()
+            for option in allowed_options
+            if str(option).strip()
+        }
+        # ``/v1/chat/completions`` rejects literal ``on``/``off`` even when
+        # model metadata publishes only those options. Omit the field for an
+        # enabled binary model so its declared default applies without a
+        # warning. The endpoint accepts ``none`` for an explicit disable.
+        if "on" in published and published.issubset({"off", "on"}):
+            if effort == "none":
+                return "none" if "off" in published else None
+            return None
+        allowed = {_LM_EFFORT_ALIASES.get(opt, opt) for opt in published}
         if effort not in allowed:
             return None
     return effort

@@ -460,13 +460,13 @@ class TestChatCompletionsKimi:
 
 class TestChatCompletionsLmStudioReasoning:
     """LM Studio publishes per-model reasoning ``allowed_options``. When the
-    user requests an effort the model can't honor (e.g. ``high`` on a
-    toggle-style ``["off","on"]`` model), the transport omits
-    ``reasoning_effort`` so LM Studio falls back to the model's default —
-    silently downgrading "high" to "low" would mislead the user.
+    user requests a graded effort from a toggle-style ``["off","on"]``
+    model, the transport omits the field so the model's declared default
+    applies without a fallback warning. For a graduated model, unsupported
+    effort levels remain omitted.
     """
 
-    def test_omits_effort_when_high_not_allowed_toggle(self, transport):
+    def test_omits_enabled_effort_for_toggle(self, transport):
         kw = transport.build_kwargs(
             model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
             is_lmstudio=True,
@@ -475,6 +475,16 @@ class TestChatCompletionsLmStudioReasoning:
             lmstudio_reasoning_options=["off", "on"],
         )
         assert "reasoning_effort" not in kw
+
+    def test_maps_disabled_reasoning_to_none_for_toggle(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
+            is_lmstudio=True,
+            supports_reasoning=True,
+            reasoning_config={"enabled": False},
+            lmstudio_reasoning_options=["off", "on"],
+        )
+        assert kw["reasoning_effort"] == "none"
 
 
     def test_passes_through_when_effort_allowed(self, transport):

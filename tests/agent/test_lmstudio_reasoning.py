@@ -29,6 +29,30 @@ def test_effort_ladder_is_monotonic():
     assert ranks == sorted(ranks), dict(zip(VALID_REASONING_EFFORTS, resolved))
 
 
+@pytest.mark.parametrize("effort", ["minimal", "medium", "high", "ultra"])
+def test_toggle_model_omits_every_enabled_effort(effort):
+    """A binary model uses its declared default without a fallback warning."""
+    assert resolve_lmstudio_effort(
+        {"enabled": True, "effort": effort}, ["off", "on"]
+    ) is None
+
+
+def test_toggle_model_uses_openai_none_when_reasoning_is_disabled():
+    assert (
+        resolve_lmstudio_effort({"enabled": False}, ["off", "on"])
+        == "none"
+    )
+
+
+def test_graduated_model_uses_openai_none_when_disabled():
+    assert (
+        resolve_lmstudio_effort(
+            {"enabled": False}, ["off", "minimal", "low"]
+        )
+        == "none"
+    )
+
+
 
 
 
