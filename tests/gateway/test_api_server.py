@@ -795,25 +795,40 @@ class TestHealthDetailedEndpoint:
         probe.assert_not_called()
 
 
-    def test_readiness_work_counts_include_stopping_runs(self, adapter):
-        """Regression: _handle_stop_run() sets status="stopping" and holds it
-        there — cooperatively, with no hard timeout — until the agent notices
-        the interrupt and the task actually exits. A run in that window is
-        still doing real executor-thread work and must count as active,
-        the same as "running"; excluding it undercounts active_api_runs for
-        the whole (now-unbounded) cooperative-stop duration."""
+    def test_readiness_work_counts_use_live_execution_not_status_ledger(self, adapter):
+        """Readiness must agree with admission and shutdown drain accounting.
+
+        The status map is retained for polling and can contain an orphaned
+        non-terminal row after the underlying task has gone.  Conversely,
+        chat/responses turns and pending authenticated requests have no run
+        status row at all.  Neither case may make readiness disagree with the
+        real concurrency slot state.
+        """
         adapter._run_statuses = {
-            "queued": {"status": "queued"},
-            "running": {"status": "running"},
-            "approval": {"status": "waiting_for_approval"},
-            "stopping": {"status": "stopping"},
+            "orphaned": {"status": "running"},
             "done": {"status": "completed"},
-            "cancelled": {"status": "cancelled"},
+        }
+        adapter._pending_agent_requests = 1
+        adapter._inflight_agent_runs = 2
+        live_task = MagicMock()
+        live_task.done.return_value = False
+        completed_task = MagicMock()
+        completed_task.done.return_value = True
+        adapter._active_run_tasks = {
+            "stopping-but-live": live_task,
+            "retained-completed": completed_task,
         }
 
         with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
              patch("tools.async_delegation.active_count", return_value=0):
             assert adapter._readiness_work_counts() == (4, 0, 0)
+
+        adapter._pending_agent_requests = 0
+        adapter._inflight_agent_runs = 0
+        adapter._active_run_tasks = {}
+        with patch("tools.process_registry.process_registry.completion_queue.qsize", return_value=0), \
+             patch("tools.async_delegation.active_count", return_value=0):
+            assert adapter._readiness_work_counts() == (0, 0, 0)
 
 
 # ---------------------------------------------------------------------------

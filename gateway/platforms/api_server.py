@@ -1274,7 +1274,7 @@ def _admit_api_agent_request(handler):
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         draining = self._draining_response()
         if draining is not None:
@@ -1746,18 +1746,22 @@ class APIServerAdapter(BasePlatformAdapter):
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
-        """Return bounded work counts from each subsystem's public state."""
-        active_api_runs = sum(
-            1
-            for status in self._run_statuses.values()
-            # "stopping" (set by _handle_stop_run) is not terminal: the run
-            # stays in this state, doing real executor-thread work, until the
-            # agent actually notices the interrupt and the task settles to
-            # "cancelled" — an unbounded window, not the old ~5s hard-timeout
-            # wait. Excluding it here undercounts active_api_runs for the
-            # whole duration of a cooperative stop.
-            if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
-        )
+        """Return bounded work counts from each subsystem's live state.
+
+        ``_run_statuses`` is a poll/replay ledger, not an execution registry.
+        A run can leave a non-terminal status behind if its task is cancelled
+        during teardown or the process loses the final status update.  Counting
+        that durable row here made ``/health/detailed`` advertise a permanently
+        busy API slot even though the concurrency limiter and shutdown drain
+        both saw no live work.  Deploy callers that correctly wait on readiness
+        would then refuse to replace the gateway forever.
+
+        Use the same live accounting chokepoint as admission and shutdown:
+        pending authenticated requests, synchronous ``_run_agent`` turns, and
+        unfinished ``/v1/runs`` tasks.  This also fixes the inverse error where
+        chat/responses work was real but absent from ``_run_statuses``.
+        """
+        active_api_runs = self.active_agent_work_count()
         process_depth = 0
         active_delegations = 0
         try:
@@ -3222,7 +3226,7 @@ class APIServerAdapter(BasePlatformAdapter):
         /proc access.  Requires the same Bearer auth as other API routes.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         from gateway.status import (
@@ -3281,7 +3285,7 @@ class APIServerAdapter(BasePlatformAdapter):
         cached ``_model_name``.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         now = int(time.time())
@@ -3330,7 +3334,7 @@ class APIServerAdapter(BasePlatformAdapter):
         `/v1/models` alias.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         refresh = _coerce_request_bool(request.query.get("refresh"), default=False)
@@ -3366,7 +3370,7 @@ class APIServerAdapter(BasePlatformAdapter):
         every Hermes version exposes the same endpoints.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         return web.json_response({
@@ -3521,7 +3525,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=403,
             )
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         try:
@@ -3962,7 +3966,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=403,
             )
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         profile = _api_request_profile.get() or "default"
@@ -4057,7 +4061,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=403,
             )
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         profile = _api_request_profile.get() or "default"
@@ -4119,7 +4123,7 @@ class APIServerAdapter(BasePlatformAdapter):
         listing matches what the agent actually loads.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         try:
@@ -4147,7 +4151,7 @@ class APIServerAdapter(BasePlatformAdapter):
         asking the model what tools it can call.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         try:
@@ -4276,7 +4280,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         db = await self._ensure_session_db_async()
@@ -4359,7 +4363,7 @@ class APIServerAdapter(BasePlatformAdapter):
         return 201 via the ON CONFLICT enrichment upsert).
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         body, err = await self._read_json_body(request)
         if err:
@@ -4473,7 +4477,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
@@ -4483,7 +4487,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
         """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
@@ -4530,7 +4534,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
@@ -4543,7 +4547,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions/{session_id}/messages."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
@@ -4602,7 +4606,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         source_id = request.match_info["session_id"]
         source, err = await self._get_existing_session_or_404(source_id)
@@ -5047,7 +5051,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
@@ -6576,7 +6580,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_get_response(self, request: "web.Request") -> "web.Response":
         """GET /v1/responses/{response_id} — retrieve a stored response."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         response_id = request.match_info["response_id"]
@@ -6589,7 +6593,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
         """DELETE /v1/responses/{response_id} — delete a stored response."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         response_id = request.match_info["response_id"]
@@ -6639,7 +6643,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6654,7 +6658,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs — create a new cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6709,7 +6713,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs/{job_id} — get a single cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6728,7 +6732,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6766,7 +6770,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
         """DELETE /api/jobs/{job_id} — delete a cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6786,7 +6790,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/pause — pause a cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6806,7 +6810,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         cron_err = self._check_jobs_available()
         if cron_err:
@@ -6826,7 +6830,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
         """POST /api/jobs/{job_id}/run — trigger immediate execution."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
         draining = self._draining_response()
         if draining is not None:
@@ -8064,7 +8068,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_get_run(self, request: "web.Request") -> "web.Response":
         """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         run_id = request.match_info["run_id"]
@@ -8079,7 +8083,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_run_events(self, request: "web.Request") -> "web.StreamResponse":
         """GET /v1/runs/{run_id}/events — SSE stream of structured agent lifecycle events."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         run_id = request.match_info["run_id"]
@@ -8131,7 +8135,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_run_approval(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         run_id = request.match_info["run_id"]
@@ -8219,7 +8223,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         run_id = request.match_info["run_id"]
@@ -8279,7 +8283,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         run_id = request.match_info["run_id"]
@@ -8318,6 +8322,66 @@ class APIServerAdapter(BasePlatformAdapter):
         """Expire old SSE buffers without treating transport age as run age."""
         if now is None:
             now = time.time()
+
+        # A non-terminal status without a live task is a poll-ledger orphan,
+        # not active execution.  Normal completion updates the status before
+        # ``_run_and_close`` removes its task, but cancellation during event
+        # loop teardown (or a future cleanup regression) can lose that final
+        # update.  Repair the public status instead of leaving clients to poll
+        # "running" forever.  Readiness does not depend on this sweep — it is
+        # grounded directly in live task accounting above — so the up-to-60s
+        # sweep cadence can never hold a deploy or concurrency slot hostage.
+        orphaned_statuses = [
+            (run_id, status, self._active_run_tasks.get(run_id))
+            for run_id, status in list(self._run_statuses.items())
+            if status.get("status")
+            in {"queued", "running", "waiting_for_approval", "stopping"}
+            and (
+                self._active_run_tasks.get(run_id) is None
+                or self._active_run_tasks[run_id].done()
+            )
+        ]
+        for run_id, status, task in orphaned_statuses:
+            cancelled = status.get("status") == "stopping" or bool(
+                task is not None and task.cancelled()
+            )
+            terminal_status = "cancelled" if cancelled else "failed"
+            last_event = f"run.{terminal_status}"
+            fields: Dict[str, Any] = {"last_event": last_event}
+            if not cancelled:
+                fields["error"] = "Run execution ended without a terminal status update"
+            logger.warning(
+                "[api_server] repairing orphaned run status %s: %s -> %s",
+                run_id,
+                status.get("status"),
+                terminal_status,
+            )
+            self._set_run_status(run_id, terminal_status, **fields)
+            q = self._run_streams.get(run_id)
+            if q is not None:
+                terminal_event: Dict[str, Any] = {
+                    "event": last_event,
+                    "run_id": run_id,
+                    "timestamp": now,
+                }
+                if "error" in fields:
+                    terminal_event["error"] = fields["error"]
+                with suppress(Exception):
+                    q.put_nowait(terminal_event)
+                    q.put_nowait(None)
+            try:
+                from tools.approval import unregister_gateway_notify
+
+                approval_session_key = self._run_approval_sessions.get(run_id)
+                if approval_session_key:
+                    unregister_gateway_notify(approval_session_key)
+            except Exception:
+                pass
+            self._active_run_agents.pop(run_id, None)
+            self._active_run_tasks.pop(run_id, None)
+            self._run_approval_sessions.pop(run_id, None)
+            self._stopping_run_ids.discard(run_id)
+
         stale = [
             run_id
             for run_id, created_at in list(self._run_streams_created.items())

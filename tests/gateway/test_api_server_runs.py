@@ -153,6 +153,67 @@ class TestStartRun:
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
 
+    def test_sweep_repairs_nonterminal_status_without_live_task(self, adapter):
+        """A lost final status update must not poll as running forever."""
+        now = time.time()
+        adapter._run_statuses = {
+            "run-orphan": {
+                "object": "hermes.run",
+                "run_id": "run-orphan",
+                "status": "running",
+                "created_at": now - 30,
+                "updated_at": now - 20,
+            }
+        }
+        adapter._active_run_tasks = {}
+        stream = MagicMock()
+        adapter._run_streams = {"run-orphan": stream}
+
+        adapter._sweep_orphaned_runs_once(now)
+
+        status = adapter._run_statuses["run-orphan"]
+        assert status["status"] == "failed"
+        assert status["last_event"] == "run.failed"
+        assert status["error"] == (
+            "Run execution ended without a terminal status update"
+        )
+        assert adapter.active_agent_work_count() == 0
+        terminal_event = stream.put_nowait.call_args_list[0].args[0]
+        assert terminal_event["event"] == "run.failed"
+        assert terminal_event["run_id"] == "run-orphan"
+        assert stream.put_nowait.call_args_list[1].args[0] is None
+
+    @pytest.mark.asyncio
+    async def test_structured_provider_failure_releases_live_work(self, adapter):
+        """A terminal provider error must release the real API slot."""
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": "API call failed after 2 retries",
+                    "failed": True,
+                    "error": "connection closed",
+                    "failure_reason": "timeout",
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    status = adapter._run_statuses[run_id]
+                    if status["status"] == "failed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "failed"
+                assert adapter.active_agent_work_count() == 0
+                assert run_id not in adapter._active_run_tasks
+                assert run_id not in adapter._active_run_agents
+
     @pytest.mark.asyncio
     async def test_opt_in_reaps_run_owned_background_processes(self, adapter, monkeypatch):
         """A task-runner policy cleans up session-owned local previews."""

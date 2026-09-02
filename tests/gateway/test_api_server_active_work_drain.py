@@ -86,7 +86,11 @@ class TestAPIServerAdapterWorkCount:
                     json={"message": "hello"},
                 )
 
-        assert response.status == 404
+        # The current request's pending reservation must not reject itself.
+        # A pre-existing session named ``s`` in the process-wide test DB makes
+        # the downstream handler return 200; an isolated DB returns 404.  The
+        # concurrency invariant under test is that neither case returns 429.
+        assert response.status != 429
 
 
     def test_counts_live_run_task_before_agent_creation(self):
@@ -604,5 +608,4 @@ class TestShutdownSettleWindow:
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
             _INTERRUPT_REASON_GATEWAY_SHUTDOWN,
         ]
-
 
