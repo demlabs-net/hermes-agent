@@ -213,9 +213,10 @@ class PlatformEntry:
 
     # ── Standalone (out-of-process) sending ──
     # Optional: async coroutine that delivers a message without a live
-    # gateway adapter.  Called by ``tools/send_message_tool._send_via_adapter``
-    # when ``cron`` runs in a separate process from the gateway and the
-    # in-process adapter weakref is therefore ``None``.
+    # gateway adapter. Normally called by
+    # ``tools/send_message_tool._send_via_adapter`` when ``cron`` runs in a
+    # separate process and the in-process adapter weakref is ``None``. It also
+    # owns host-driven media delivery when ``supports_media_delivery`` is true.
     #
     # Signature:
     #     async (pconfig, chat_id, message, *, thread_id=None,
@@ -227,6 +228,15 @@ class PlatformEntry:
     # Without this hook, plugin platforms cannot serve as cron ``deliver=``
     # targets when the gateway is not co-resident with the cron process.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
+
+    # Declare that ``standalone_sender_fn`` owns the complete host-driven
+    # text+media envelope. When media is present, ``send_message`` and cron
+    # call that sender exactly once with the full unsplit text, normalized
+    # ``media_files`` and ``force_document`` flag, even if a live gateway
+    # adapter exists. This avoids hard-coding plugin names in the host router
+    # and lets the plugin validate every file before any partial delivery.
+    # False preserves the historical text-only plugin behavior.
+    supports_media_delivery: bool = False
 
 
 class PlatformRegistry:

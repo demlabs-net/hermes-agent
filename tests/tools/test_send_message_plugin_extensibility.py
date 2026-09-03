@@ -51,6 +51,55 @@ def plugin_platform():
         platform_registry.unregister(name)
 
 
+@pytest.fixture
+def media_plugin_platform():
+    name = "media-ext-test"
+    seen: list[dict] = []
+
+    def parser(ref: str):
+        normalized = ref.strip().lower()
+        return (normalized, "thread-7") if normalized else None
+
+    async def sender(
+        pconfig,
+        chat_id,
+        message,
+        *,
+        thread_id=None,
+        media_files=None,
+        force_document=False,
+    ):
+        seen.append(
+            {
+                "pconfig": pconfig,
+                "chat_id": chat_id,
+                "message": message,
+                "thread_id": thread_id,
+                "media_files": list(media_files or []),
+                "force_document": force_document,
+            }
+        )
+        return {"success": True, "message_id": "media-message"}
+
+    entry = PlatformEntry(
+        name=name,
+        label="Fixture Media",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        parse_target_ref_fn=parser,
+        standalone_sender_fn=sender,
+        supports_media_delivery=True,
+        # The media owner must receive the full envelope despite a nominal
+        # text-only chunk limit.
+        max_message_length=64,
+    )
+    platform_registry.register(entry)
+    try:
+        yield name, entry, seen
+    finally:
+        platform_registry.unregister(name)
+
+
 def _config_for(name: str):
     platform = Platform(name)
     pconfig = SimpleNamespace(enabled=True, token=None, extra={})
@@ -150,6 +199,145 @@ def test_host_send_honors_sync_and_async_plugin_handlers(plugin_platform, async_
     assert result["platform"] == name
     assert result["chat_id"] == "@alice@example.com"
     assert seen[-1]["args"]["subject"] == "greeting"
+
+
+def test_plugin_media_capability_delivers_media_only_once_with_live_gateway(
+    media_plugin_platform,
+    tmp_path,
+):
+    name, _entry, seen = media_plugin_platform
+    platform, pconfig, config = _config_for(name)
+    media = tmp_path / "diagram.png"
+    media.write_bytes(b"\x89PNG\r\n\x1a\nfixture")
+
+    class TextOnlyLiveAdapter:
+        async def send(self, **kwargs):
+            raise AssertionError(f"live text-only adapter was called: {kwargs}")
+
+    runner = SimpleNamespace(adapters={platform: TextOnlyLiveAdapter()})
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False), \
+         patch("gateway.run._gateway_runner_ref", return_value=runner), \
+         patch("gateway.mirror.mirror_to_session", return_value=True):
+        result = json.loads(send_message_tool({
+            "target": f"{name}:Engineering",
+            "message": f"[[as_document]]\nMEDIA:{media}",
+        }))
+
+    assert result["success"] is True
+    assert result["message_id"] == "media-message"
+    assert "warnings" not in result
+    assert len(seen) == 1
+    assert seen[0] == {
+        "pconfig": pconfig,
+        "chat_id": "engineering",
+        "message": "",
+        "thread_id": "thread-7",
+        "media_files": [(str(media.resolve()), False)],
+        "force_document": True,
+    }
+
+
+def test_plugin_media_capability_receives_unsplit_text_and_files_once(
+    media_plugin_platform,
+    tmp_path,
+):
+    name, _entry, seen = media_plugin_platform
+    _platform, _pconfig, config = _config_for(name)
+    media = tmp_path / "report.pdf"
+    media.write_bytes(b"%PDF-1.7\nfixture")
+    text = "full-envelope-" * 20
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False), \
+         patch("gateway.mirror.mirror_to_session", return_value=False):
+        result = json.loads(send_message_tool({
+            "target": f"{name}:Engineering",
+            "message": f"{text}\nMEDIA:{media}",
+        }))
+
+    assert result["success"] is True
+    assert len(text) > 64
+    assert len(seen) == 1
+    assert seen[0]["message"] == text
+    assert seen[0]["media_files"] == [(str(media.resolve()), False)]
+
+
+def test_plugin_media_capability_keeps_text_only_live_adapter_first(
+    media_plugin_platform,
+):
+    name, _entry, seen = media_plugin_platform
+    platform, _pconfig, config = _config_for(name)
+    live_calls = []
+
+    class LiveAdapter:
+        async def send(self, **kwargs):
+            live_calls.append(kwargs)
+            return SimpleNamespace(success=True, message_id="live-message")
+
+    runner = SimpleNamespace(adapters={platform: LiveAdapter()})
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False), \
+         patch("gateway.run._gateway_runner_ref", return_value=runner), \
+         patch("gateway.mirror.mirror_to_session", return_value=False):
+        result = json.loads(send_message_tool({
+            "target": f"{name}:Engineering",
+            "message": "text only",
+        }))
+
+    assert result["success"] is True
+    assert result["message_id"] == "live-message"
+    assert seen == []
+    assert live_calls == [
+        {"chat_id": "engineering", "content": "text only", "metadata": {"thread_id": "thread-7"}}
+    ]
+
+
+def test_plugin_media_capability_requires_a_registered_sender(media_plugin_platform):
+    name, entry, _seen = media_plugin_platform
+    platform, pconfig, _config = _config_for(name)
+    entry.standalone_sender_fn = None
+
+    from tools.send_message_tool import _send_to_platform
+
+    result = asyncio.run(
+        _send_to_platform(
+            platform,
+            pconfig,
+            "engineering",
+            "",
+            media_files=[("/already-normalized/file.bin", False)],
+        )
+    )
+
+    assert result == {
+        "error": (
+            f"Plugin platform '{name}' declares media delivery "
+            "but has no standalone_sender_fn"
+        )
+    }
+
+
+def test_plugin_without_media_capability_keeps_legacy_media_only_rejection(
+    plugin_platform,
+    tmp_path,
+):
+    name, entry, seen = plugin_platform
+    _platform, _pconfig, config = _config_for(name)
+    media = tmp_path / "legacy.png"
+    media.write_bytes(b"\x89PNGfixture")
+    assert entry.supports_media_delivery is False
+
+    with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("tools.interrupt.is_interrupted", return_value=False):
+        result = json.loads(send_message_tool({
+            "target": f"{name}:@Alice@Example.COM",
+            "message": f"MEDIA:{media}",
+        }))
+
+    assert "error" in result
+    assert "supports_media_delivery" in result["error"]
+    assert seen == []
 
 
 def test_cli_and_cron_share_plugin_target_normalization(plugin_platform, monkeypatch, capsys):
@@ -270,3 +458,73 @@ print(json.dumps({"host_send": host_send, "cron": cron,
     assert payload["host_send"]["chat_id"] == "@alice@example.com"
     assert payload["cron"]["chat_id"] == "@alice@example.com"
     assert payload["model_registered"] is False
+
+
+def test_fresh_process_plugin_media_capability_uses_real_discovery(tmp_path):
+    """A directory plugin can opt into media without a core name branch."""
+    home = tmp_path / "home"
+    plugin = home / "plugins" / "media-fixture"
+    plugin.mkdir(parents=True)
+    media = tmp_path / "evidence.txt"
+    media.write_text("evidence")
+    (plugin / "plugin.yaml").write_text(
+        "name: media-fixture\nversion: 0.1.0\ndescription: fixture\nkind: platform\n"
+    )
+    (home / "config.yaml").write_text("plugins:\n  enabled:\n    - media-fixture\n")
+    (plugin / "__init__.py").write_text(
+        "async def _send(pconfig, chat_id, message, *, thread_id=None, "
+        "media_files=None, force_document=False):\n"
+        "    return {'success': True, 'chat_id': chat_id, 'message': message, "
+        "'thread_id': thread_id, 'media_files': media_files, "
+        "'force_document': force_document}\n"
+        "def _parse(ref):\n"
+        "    return (ref.strip().lower(), 'thread-e2e') if ref.strip() else None\n"
+        "def register(ctx):\n"
+        "    ctx.register_platform(name='media_fixture', label='Media Fixture', "
+        "adapter_factory=lambda cfg: None, check_fn=lambda: True, "
+        "parse_target_ref_fn=_parse, standalone_sender_fn=_send, "
+        "supports_media_delivery=True, max_message_length=32)\n"
+    )
+    script = r'''
+import json
+import os
+from types import SimpleNamespace
+from unittest.mock import patch
+from hermes_cli.plugins import discover_plugins
+from gateway.config import Platform
+from tools.send_message_tool import send_message_tool
+
+discover_plugins()
+platform = Platform("media_fixture")
+pconfig = SimpleNamespace(enabled=True, token=None, extra={})
+config = SimpleNamespace(platforms={platform: pconfig}, get_home_channel=lambda p: None)
+with patch("gateway.config.load_gateway_config", return_value=config), \
+     patch("tools.interrupt.is_interrupted", return_value=False), \
+     patch("gateway.mirror.mirror_to_session", return_value=False):
+    result = json.loads(send_message_tool({
+        "target": "media_fixture:ROOM",
+        "message": "caption\nMEDIA:" + os.environ["FIXTURE_MEDIA"],
+    }))
+print(json.dumps(result))
+'''
+    env = dict(os.environ)
+    env.update({
+        "HERMES_HOME": str(home),
+        "HERMES_KANBAN_TASK": "fixture",
+        "FIXTURE_MEDIA": str(media),
+        "PYTHONPATH": os.getcwd(),
+    })
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=os.getcwd(),
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    payload = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert payload["success"] is True
+    assert payload["chat_id"] == "room"
+    assert payload["message"] == "caption"
+    assert payload["thread_id"] == "thread-e2e"
+    assert payload["media_files"] == [[str(media.resolve()), False]]

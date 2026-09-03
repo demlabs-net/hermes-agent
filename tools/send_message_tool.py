@@ -887,30 +887,16 @@ async def _send_via_adapter(
         entry = None
 
     if entry is not None and entry.standalone_sender_fn is not None:
-        try:
-            result = await entry.standalone_sender_fn(
-                pconfig,
-                chat_id,
-                chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
-            return {"error": f"Plugin standalone send failed: {e}"}
-
-        if isinstance(result, dict) and (result.get("success") or result.get("error")):
-            return result
-        return {
-            "error": (
-                f"Plugin standalone send for '{platform_name}' returned an "
-                f"invalid result: expected a dict with 'success' or 'error' "
-                f"keys, got {type(result).__name__}"
-            )
-        }
+        return await _call_plugin_standalone_sender(
+            platform_name,
+            entry.standalone_sender_fn,
+            pconfig,
+            chat_id,
+            chunk,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
 
     return {
         "error": (
@@ -918,6 +904,44 @@ async def _send_via_adapter(
             f"running with this platform connected? For out-of-process delivery "
             f"(e.g. cron in a separate process), the platform plugin must "
             f"register a standalone_sender_fn on its PlatformEntry."
+        )
+    }
+
+
+async def _call_plugin_standalone_sender(
+    platform_name,
+    sender,
+    pconfig,
+    chat_id,
+    message,
+    *,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+):
+    """Invoke one registered sender and enforce its public result contract."""
+    try:
+        result = await sender(
+            pconfig,
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.debug("Plugin standalone send for %s raised", platform_name, exc_info=True)
+        return {"error": f"Plugin standalone send failed: {e}"}
+
+    if isinstance(result, dict) and (result.get("success") or result.get("error")):
+        return result
+    return {
+        "error": (
+            f"Plugin standalone send for '{platform_name}' returned an "
+            f"invalid result: expected a dict with 'success' or 'error' "
+            f"keys, got {type(result).__name__}"
         )
     }
 
@@ -941,6 +965,38 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # example lark-oapi's heavy Feishu import path).
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+
+    entry = None
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        entry = None
+
+    # A plugin that explicitly owns media delivery receives the normalized,
+    # unsplit envelope exactly once. The registered sender remains usable from
+    # cron processes and is also preferred here when a live gateway exists, so
+    # media cannot disappear through the live adapter's text-only send().
+    if media_files and entry is not None and getattr(
+        entry, "supports_media_delivery", False
+    ):
+        if entry.standalone_sender_fn is None:
+            return {
+                "error": (
+                    f"Plugin platform '{platform_name}' declares media delivery "
+                    "but has no standalone_sender_fn"
+                )
+            }
+        return await _call_plugin_standalone_sender(
+            platform_name,
+            entry.standalone_sender_fn,
+            pconfig,
+            chat_id,
+            message,
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document,
+        )
 
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
 
@@ -981,14 +1037,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         _MAX_LENGTHS[Platform.SIGNAL] = 8000
 
     # Check plugin registry for max_message_length
-    if platform not in _MAX_LENGTHS:
-        try:
-            from gateway.platform_registry import platform_registry
-            entry = platform_registry.get(platform.value)
-            if entry and entry.max_message_length > 0:
-                _MAX_LENGTHS[platform] = entry.max_message_length
-        except Exception:
-            pass
+    if platform not in _MAX_LENGTHS and entry and entry.max_message_length > 0:
+        _MAX_LENGTHS[platform] = entry.max_message_length
 
     # Smart-chunk the message to fit within platform limits.
     # For short messages or platforms without a known limit this is a no-op.
@@ -1264,6 +1314,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         return {
             "error": (
                 f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack; "
+                "plugin platforms may opt in through supports_media_delivery; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -1271,7 +1322,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
+            "native send_message media delivery is currently only supported for "
+            "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp "
+            "and slack, or plugin platforms declaring supports_media_delivery"
         )
 
     last_result = None
@@ -1297,9 +1350,6 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.YUANBAO:
             result = await _send_yuanbao(chat_id, chunk)
         else:
-            from gateway.platform_registry import platform_registry
-
-            entry = platform_registry.get(platform_name)
             handler = entry.send_message_handler if entry is not None else None
             if handler is not None:
                 try:

@@ -227,6 +227,7 @@ When you call `ctx.register_platform()`, the following integration points are ha
 | Channel directory | Plugin platforms included in enumeration |
 | System prompt hints | `platform_hint` injected into LLM context |
 | Message chunking | `max_message_length` for smart splitting |
+| Host-driven media | `supports_media_delivery` delegates the complete envelope to `standalone_sender_fn` |
 | PII redaction | `pii_safe` flag |
 | `hermes status` | Shows plugin platforms with `(plugin)` tag |
 | `hermes gateway setup` | Plugin platforms appear in setup menu |
@@ -412,12 +413,23 @@ ctx.register_platform(
     ...
     cron_deliver_env_var="MY_PLATFORM_HOME_CHANNEL",
     standalone_sender_fn=_standalone_send,
+    supports_media_delivery=True,
 )
 ```
 
 Why this hook is necessary: built-in platforms (Telegram, Discord, Slack, etc.) ship direct REST helpers in `tools/send_message_tool.py` so cron can deliver without holding the gateway in the same process. Plugin platforms historically depended on `_gateway_runner_ref()`, which returns `None` outside the gateway process, so without `standalone_sender_fn` the cron-side send fails with `No live adapter for platform '<name>'`.
 
 The function receives the same `pconfig` and `chat_id` that the live adapter would, plus optional `thread_id`, `media_files`, and `force_document` keyword arguments. Returning `{"success": True, "message_id": ...}` is treated as a successful delivery; returning `{"error": "..."}` surfaces the message in cron's `delivery_errors`. Exceptions raised inside the function are caught by the dispatcher and reported as `Plugin standalone send failed: <reason>`. Reference implementations live in `plugins/platforms/{irc,teams,google_chat}/adapter.py`.
+
+Set `supports_media_delivery=True` only when this sender can deliver the
+normalized `media_files` list. For a media-bearing request Hermes calls the
+sender exactly once with the complete unsplit text/media envelope, even when a
+live gateway adapter exists. The sender therefore owns platform-specific text
+chunking, file batching, and partial-delivery semantics for that request. This
+keeps plugin names out of the core media allow-list and prevents attaching the
+same files to every host-generated text chunk. Text-only requests retain the
+usual live-adapter-first behavior. The default is `False`, so existing plugins
+remain text-only unless they opt in.
 
 ## Surfacing Env Vars in `hermes config`
 
