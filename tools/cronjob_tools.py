@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -1346,6 +1347,38 @@ def _gateway_liveness_notice(plural: bool = False) -> dict:
     return {"gateway_running": True}
 
 
+def _model_protected_cron_names() -> set[str]:
+    """Return cron names the model-facing tool may not mutate.
+
+    Operators and deployment code still use the CLI/store APIs directly. The
+    guard only prevents an agent turn from disabling source-controlled
+    watchdogs or queue pumps after misinterpreting an unrelated user request.
+    The environment accepts either a JSON string list or a comma-separated
+    list so Compose can reuse an existing allowlist.
+    """
+    raw = os.getenv("HERMES_CRON_MODEL_PROTECTED_NAMES", "").strip()
+    if not raw:
+        return set()
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        parsed = raw.split(",")
+    if isinstance(parsed, str):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return set()
+    return {str(value).strip() for value in parsed if str(value).strip()}
+
+
+def _protected_cron_error(name: Optional[str], action: str) -> Optional[str]:
+    if not name or name not in _model_protected_cron_names():
+        return None
+    return (
+        f"Cron job '{name}' is source-controlled and cannot be {action} by "
+        "the model-facing cron tool. Change its deployment policy instead."
+    )
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -1381,6 +1414,9 @@ def cronjob(
         normalized = (action or "").strip().lower()
 
         if normalized == "create":
+            protected_error = _protected_cron_error(name, "created")
+            if protected_error:
+                return tool_error(protected_error, success=False)
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
             canonical_skills = _canonical_skills(skill, skills)
@@ -1562,6 +1598,11 @@ def cronjob(
             )
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
+
+        if normalized in {"remove", "pause", "update"}:
+            protected_error = _protected_cron_error(job.get("name"), normalized + "d")
+            if protected_error:
+                return tool_error(protected_error, success=False)
 
         if normalized == "remove":
             removed = remove_job(job_id)

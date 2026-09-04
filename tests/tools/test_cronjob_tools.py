@@ -280,6 +280,65 @@ class TestUnifiedCronjobTool:
         assert resumed["success"] is True
         assert resumed["job"]["state"] == "scheduled"
 
+    def test_model_cannot_mutate_source_controlled_cron(self, monkeypatch):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Keep the conveyor moving",
+                schedule="every 1m",
+                name="manager-queue-pump",
+            )
+        )
+        job_id = created["job_id"]
+        monkeypatch.setenv(
+            "HERMES_CRON_MODEL_PROTECTED_NAMES",
+            '["manager-queue-pump", "manager-batch-driver"]',
+        )
+
+        for action in ("pause", "remove", "update"):
+            kwargs = {"name": "renamed"} if action == "update" else {}
+            result = json.loads(cronjob(action=action, job_id=job_id, **kwargs))
+            assert result["success"] is False
+            assert "source-controlled" in result["error"]
+
+        from cron.jobs import get_job
+
+        stored = get_job(job_id)
+        assert stored["enabled"] is True
+        assert stored["name"] == "manager-queue-pump"
+
+        duplicate = json.loads(
+            cronjob(
+                action="create",
+                prompt="duplicate",
+                schedule="every 1m",
+                name="manager-queue-pump",
+            )
+        )
+        assert duplicate["success"] is False
+        assert "source-controlled" in duplicate["error"]
+
+    def test_model_can_resume_source_controlled_cron(self, monkeypatch):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Keep the conveyor moving",
+                schedule="every 1m",
+                name="manager-queue-pump",
+            )
+        )
+        from cron.jobs import pause_job
+
+        pause_job(created["job_id"], reason="operator maintenance")
+        monkeypatch.setenv(
+            "HERMES_CRON_MODEL_PROTECTED_NAMES",
+            "manager-queue-pump,manager-batch-driver",
+        )
+
+        resumed = json.loads(cronjob(action="resume", job_id=created["job_id"]))
+        assert resumed["success"] is True
+        assert resumed["job"]["state"] == "scheduled"
+
 
     @staticmethod
     def _patch_named_legit(monkeypatch):
