@@ -250,6 +250,90 @@ def _model_consumes_thought_signature(model: Any) -> bool:
     return "gemini" in m or "gemma" in m
 
 
+def _promote_tool_images_to_user_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep native vision on strict Chat Completions tool schemas.
+
+    Several OpenAI-compatible servers, including LM Studio, accept
+    ``image_url`` parts on ``user`` messages but reject the same parts on a
+    ``tool`` message.  Preserve the tool-call/result pairing with a plain-text
+    tool result, then expose the image as one synthetic user turn after the
+    complete contiguous tool-result block.  Deferring until the end of the
+    block is important when one assistant turn issued multiple tool calls.
+
+    The transformation is wire-only and copy-on-write: persisted history keeps
+    the original multimodal tool result, so another provider can still replay
+    it natively after a model switch.
+    """
+    output: list[dict[str, Any]] = []
+    pending_parts: list[dict[str, Any]] = []
+
+    def flush_pending(next_message: dict[str, Any] | None = None) -> bool:
+        nonlocal pending_parts
+        if not pending_parts:
+            return False
+        visual_parts = [
+            {
+                "type": "text",
+                "text": "Visual payload returned by the preceding tool result(s).",
+            },
+            *pending_parts,
+        ]
+        pending_parts = []
+        if next_message is not None and next_message.get("role") == "user":
+            existing = next_message.get("content")
+            if isinstance(existing, list):
+                next_message["content"] = [*visual_parts, *existing]
+            elif isinstance(existing, str) and existing:
+                next_message["content"] = [
+                    *visual_parts,
+                    {"type": "text", "text": existing},
+                ]
+            else:
+                next_message["content"] = visual_parts
+            return True
+        output.append({"role": "user", "content": visual_parts})
+        return False
+
+    for original in messages:
+        msg = original
+        if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+            content = msg["content"]
+            image_parts = [
+                part
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") in {"image_url", "image", "input_image"}
+            ]
+            if image_parts:
+                text_parts = []
+                for part in content:
+                    if isinstance(part, str) and part.strip():
+                        text_parts.append(part.strip())
+                    elif (
+                        isinstance(part, dict)
+                        and part.get("type") in {"text", "input_text"}
+                        and str(part.get("text") or "").strip()
+                    ):
+                        text_parts.append(str(part["text"]).strip())
+                msg = dict(msg)
+                msg["content"] = "\n\n".join(text_parts) or (
+                    "[image content follows in a user message]"
+                )
+                pending_parts.extend(image_parts)
+
+        if msg.get("role") != "tool" and pending_parts:
+            copied = dict(msg)
+            merged = flush_pending(copied)
+            if merged:
+                msg = copied
+        output.append(msg)
+
+    flush_pending()
+    return output
+
+
 class ChatCompletionsTransport(ProviderTransport):
     """Transport for api_mode='chat_completions'.
 
@@ -299,6 +383,7 @@ class ChatCompletionsTransport(ProviderTransport):
         strip_extra_content = not _model_consumes_thought_signature(
             kwargs.get("model")
         )
+        promote_tool_images = kwargs.get("supports_vision_tool_messages") is False
         needs_sanitize = False
         for msg in messages:
             if not isinstance(msg, dict):
@@ -354,6 +439,18 @@ class ChatCompletionsTransport(ProviderTransport):
             ):
                 # Explicit ``tool_calls: null`` is equally invalid on strict
                 # providers — treat it like the empty-array case.
+                needs_sanitize = True
+                break
+            if (
+                promote_tool_images
+                and msg.get("role") == "tool"
+                and isinstance(msg.get("content"), list)
+                and any(
+                    isinstance(part, dict)
+                    and part.get("type") in {"image_url", "image", "input_image"}
+                    for part in msg["content"]
+                )
+            ):
                 needs_sanitize = True
                 break
 
@@ -442,6 +539,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 # Explicit ``tool_calls: null`` is invalid on strict
                 # providers — drop the key entirely.
                 mutable_msg().pop("tool_calls", None)
+        if promote_tool_images:
+            sanitized = _promote_tool_images_to_user_messages(sanitized)
         return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -504,7 +603,13 @@ class ChatCompletionsTransport(ProviderTransport):
         # Codex sanitization: drop reasoning_items / call_id / response_item_id.
         # Pass model so the Gemini thought_signature (extra_content) is kept for
         # Gemini targets and stripped for strict non-Gemini providers.
-        sanitized = self.convert_messages(messages, model=model)
+        sanitized = self.convert_messages(
+            messages,
+            model=model,
+            supports_vision_tool_messages=params.get(
+                "supports_vision_tool_messages", True
+            ),
+        )
 
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")

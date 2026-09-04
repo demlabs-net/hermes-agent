@@ -104,6 +104,10 @@ custom = CustomProfile(
     ),
     env_vars=(),  # No fixed key — custom endpoint
     base_url="",  # User-configured
+    # Local OpenAI-compatible servers commonly accept image_url only on user
+    # messages. The chat transport preserves native vision by promoting image
+    # parts out of tool results into a synthetic user turn.
+    supports_vision_tool_messages=False,
     # Without this, no max_tokens is sent and Ollama falls back to its internal
     # num_predict=128, truncating responses after a few tokens (#39281). This is
     # only a floor used when the user hasn't set model.max_tokens — they can

@@ -2059,6 +2059,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             openrouter_min_coding_score=agent.openrouter_min_coding_score,
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
+            supports_vision_tool_messages=getattr(
+                _profile, "supports_vision_tool_messages", True
+            ),
             qwen_session_metadata=_qwen_meta,
         )
 
@@ -2104,6 +2107,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         supports_reasoning=agent._supports_reasoning_extra_body(),
+        # Unknown/custom OpenAI-compatible endpoints are strict by default.
+        # They can still receive native images: the transport promotes image
+        # parts from tool results into a synthetic user message instead of
+        # discarding the pixels.
+        supports_vision_tool_messages=(agent.provider != "custom"),
         github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
