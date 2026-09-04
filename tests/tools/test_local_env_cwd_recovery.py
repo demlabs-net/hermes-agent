@@ -54,6 +54,7 @@ def _make_fake_popen(captured: dict, fds: list):
     caller can clean up after the test.
     """
     def fake_popen(cmd, **kwargs):
+        captured["command"] = cmd
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env", {})
         read_fd, write_fd = os.pipe()
@@ -108,6 +109,9 @@ class TestRunBashCwdRecovery:
         # Popen must have been handed a real, existing directory.
         assert captured["cwd"] == str(tmp_path)
         assert os.path.isdir(captured["cwd"])
+        rendered = " ".join(str(item) for item in captured["command"])
+        assert str(wedged) not in rendered
+        assert f"builtin cd -- {tmp_path}" in rendered
 
         # ``self.cwd`` is updated so the next call doesn't re-warn.
         assert env.cwd == str(tmp_path)

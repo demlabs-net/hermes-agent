@@ -1463,6 +1463,15 @@ class BaseEnvironment(ABC):
         """
         pass
 
+    def _resolve_execution_cwd(self, cwd: str) -> str:
+        """Return the cwd embedded in the command wrapper and used by Popen.
+
+        Remote backends normally keep the requested path verbatim. Local
+        backends override this hook to repair a deleted session cwd before the
+        wrapper's leading ``cd`` is rendered.
+        """
+        return cwd
+
     # ------------------------------------------------------------------
     # Unified execute()
     # ------------------------------------------------------------------
@@ -1498,7 +1507,7 @@ class BaseEnvironment(ABC):
             from tools.terminal_tool import _rewrite_compound_background
             exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
-        effective_cwd = cwd or self.cwd
+        effective_cwd = self._resolve_execution_cwd(cwd or self.cwd)
 
         # Merge sudo stdin with caller stdin
         if sudo_stdin is not None and stdin_data is not None:

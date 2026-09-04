@@ -1812,6 +1812,24 @@ class LocalEnvironment(BaseEnvironment):
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
 
+    def _resolve_execution_cwd(self, cwd: str) -> str:
+        """Repair a stale local cwd before the shell wrapper embeds its cd."""
+        safe_cwd = _resolve_safe_cwd(cwd)
+        if safe_cwd != cwd:
+            # MSYS → Windows translation alone is benign normalization. Warn
+            # only when the path really disappeared or became unusable.
+            normalized = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
+            if safe_cwd != normalized:
+                logger.warning(
+                    "LocalEnvironment cwd %r is missing on disk; "
+                    "falling back to %r so terminal commands keep working.",
+                    cwd,
+                    safe_cwd,
+                )
+        if cwd == self.cwd:
+            self.cwd = safe_cwd
+        return safe_cwd
+
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
@@ -1839,21 +1857,11 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
-            self.cwd = safe_cwd
-
+        # Keep a last-moment guard for a directory deleted after execute()
+        # built its wrapper. The normal path is repaired earlier by
+        # _resolve_execution_cwd so both this Popen cwd and the wrapper's
+        # leading cd name the same live directory.
+        self.cwd = self._resolve_execution_cwd(self.cwd)
         _popen_cwd = self.cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
