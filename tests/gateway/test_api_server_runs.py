@@ -22,6 +22,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _approval_event_choices,
+    _start_api_run_budget_watchdog,
     cors_middleware,
     security_headers_middleware,
 )
@@ -55,6 +56,50 @@ def test_approval_event_choices_follow_backend_capabilities(
         )
         == expected
     )
+
+
+def test_api_run_budget_watchdog_requests_hard_interrupt(monkeypatch):
+    observed = {}
+
+    class FakeTimer:
+        def __init__(self, interval, callback):
+            observed["interval"] = interval
+            observed["callback"] = callback
+            self.daemon = False
+
+        def start(self):
+            observed["started"] = True
+
+        def cancel(self):
+            observed["cancelled"] = True
+
+    agent = MagicMock()
+    agent.run_budget_seconds = 1200
+    interrupt = MagicMock()
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.threading.Timer", FakeTimer
+    )
+    monkeypatch.setattr(
+        "gateway.platforms.api_server.request_hard_interrupt", interrupt
+    )
+
+    watchdog = _start_api_run_budget_watchdog(agent, "run_bounded")
+    assert watchdog is not None
+    assert observed["interval"] == 1200
+    assert observed["started"] is True
+    assert watchdog.daemon is True
+
+    observed["callback"]()
+    interrupt.assert_called_once_with(
+        agent, "API run wall-clock budget exhausted after 1200s"
+    )
+
+
+@pytest.mark.parametrize("budget", [None, 0, -1, "invalid"])
+def test_api_run_budget_watchdog_is_dormant_without_positive_budget(budget):
+    agent = MagicMock()
+    agent.run_budget_seconds = budget
+    assert _start_api_run_budget_watchdog(agent, "run_unbounded") is None
 
 
 def _make_adapter(api_key: str = "") -> APIServerAdapter:

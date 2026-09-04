@@ -118,6 +118,44 @@ _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
 
+def _start_api_run_budget_watchdog(agent: Any, run_id: str) -> Optional[threading.Timer]:
+    """Hard-stop a public ``/v1/runs`` turn at its configured run budget.
+
+    ``agent.run_budget_seconds`` historically only injected a wrap-up hint at
+    80%. That leaves an unattended API run free to spend hours in a slow model
+    call or context-compression pass. The API runner needs a real wall-clock
+    fence because its occupied slot blocks the role FIFO and graceful deploy.
+    The interrupt remains cooperative, so normal turn finalization and
+    on-session-end hooks still persist durable task state.
+    """
+    budget = getattr(agent, "run_budget_seconds", None)
+    try:
+        budget_seconds = float(budget)
+    except (TypeError, ValueError):
+        return None
+    if budget_seconds <= 0:
+        return None
+
+    def _expire() -> None:
+        logger.warning(
+            "[api_server] run %s exhausted hard wall-clock budget %.0fs",
+            run_id,
+            budget_seconds,
+        )
+        try:
+            request_hard_interrupt(
+                agent,
+                f"API run wall-clock budget exhausted after {budget_seconds:.0f}s",
+            )
+        except Exception:
+            logger.exception("[api_server] run %s budget interrupt failed", run_id)
+
+    watchdog = threading.Timer(budget_seconds, _expire)
+    watchdog.daemon = True
+    watchdog.start()
+    return watchdog
+
+
 def _approval_event_choices(
     *, smart_denied: bool, allow_session: bool, allow_permanent: bool
 ) -> list[str]:
@@ -7839,6 +7877,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    run_budget_watchdog = None
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -7874,12 +7913,17 @@ class APIServerAdapter(BasePlatformAdapter):
                                 effective_task_id,
                                 session_key=approval_session_key,
                             )
+                            run_budget_watchdog = _start_api_run_budget_watchdog(
+                                agent, run_id
+                            )
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                             )
                         finally:
+                            if run_budget_watchdog is not None:
+                                run_budget_watchdog.cancel()
                             # A stateless task runner can opt into treating all
                             # background work created during /v1/runs as
                             # run-owned scratch state. Reap before clearing the
