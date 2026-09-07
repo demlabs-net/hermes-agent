@@ -216,7 +216,15 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
 RUN cd plugins/platforms/photon/sidecar && \
-    npm ci --no-audit --fetch-retries=5 && \
+    for i in 1 2 3; do \
+        timeout --signal=TERM --kill-after=15s 180s \
+            npm ci --no-audit \
+                --fetch-retries=3 \
+                --fetch-retry-mintimeout=1000 \
+                --fetch-retry-maxtimeout=5000 \
+                --fetch-timeout=30000 && break || \
+        { [ "$i" = 3 ] && exit 1; echo "Photon npm ci failed (attempt $i); retrying in 5s"; sleep 5; }; \
+    done && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
@@ -463,7 +471,3 @@ VOLUME [ "/opt/data" ]
 # intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/opt/hermes/docker/entrypoint-dispatch.sh" ]
 CMD [ ]
-
-# Source and bundled resources must remain readable when the swarm supplies a
-# non-root runtime UID rather than the image's default account.
-RUN chmod -R a+rX /opt/hermes
