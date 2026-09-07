@@ -165,6 +165,7 @@ COPY --chmod=0755 --from=node_source /usr/local/bin/node /usr/local/bin/
 COPY --from=node_source /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+COPY --chmod=0755 docker/npm-bounded.sh /usr/local/bin/npm-bounded
 
 WORKDIR /opt/hermes
 
@@ -196,9 +197,10 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+RUN npm-bounded install --prefer-offline --no-audit && \
     for i in 1 2 3; do \
-        npx playwright install --with-deps chromium --only-shell && break || \
+        timeout --signal=TERM --kill-after=15s 300s \
+            npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
     done && \
     npm cache clean --force
@@ -216,15 +218,7 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
 RUN cd plugins/platforms/photon/sidecar && \
-    for i in 1 2 3; do \
-        timeout --signal=TERM --kill-after=15s 180s \
-            npm ci --no-audit \
-                --fetch-retries=3 \
-                --fetch-retry-mintimeout=1000 \
-                --fetch-retry-maxtimeout=5000 \
-                --fetch-timeout=30000 && break || \
-        { [ "$i" = 3 ] && exit 1; echo "Photon npm ci failed (attempt $i); retrying in 5s"; sleep 5; }; \
-    done && \
+    NPM_BOUNDED_TIMEOUT_SECONDS=180 npm-bounded ci --no-audit && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------

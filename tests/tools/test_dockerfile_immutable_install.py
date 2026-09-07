@@ -108,15 +108,11 @@ def test_dockerfile_bakes_photon_sidecar_deps() -> None:
     text = _dockerfile_text()
 
     assert "plugins/platforms/photon/sidecar/package-lock.json" in text
-    assert re.search(
-        r"RUN cd plugins/platforms/photon/sidecar && \\\n\s+npm ci", text
-    ) or re.search(
-        r"RUN cd plugins/platforms/photon/sidecar && \\\n(?:.*\\\n)*?\s+npm ci",
-        text,
-    ), "sidecar deps must be installed with `npm ci` (deterministic, runs postinstall patch)"
-    assert "timeout --signal=TERM --kill-after=15s 180s" in text
-    assert "--fetch-timeout=30000" in text
-    assert "Photon npm ci failed (attempt $i)" in text
+    assert "npm-bounded ci --no-audit" in text, (
+        "sidecar deps must be installed with bounded `npm ci` "
+        "(deterministic, runs postinstall patch)"
+    )
+    assert "NPM_BOUNDED_TIMEOUT_SECONDS=180 npm-bounded ci --no-audit" in text
     # Immutability contract: never chown the sidecar tree to the runtime user.
     assert not re.search(
         r"chown\s+-R\s+hermes:hermes\s+/opt/hermes/plugins", text
