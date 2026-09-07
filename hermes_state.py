@@ -14462,12 +14462,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     ) -> Dict[str, Any]:
         """Idempotent auto-maintenance: prune inactive sessions + optional VACUUM.
 
-        Records the last run timestamp in state_meta so subsequent calls
-        within ``min_interval_hours`` no-op. VACUUM has its own, typically
-        longer, throttle controlled by ``min_vacuum_interval_days`` so routine
-        pruning does not repeatedly rewrite the database. Designed to be
-        called once at startup from long-lived entrypoints (CLI, gateway, cron
-        scheduler).
+        Records the last run timestamp and retention policy in state_meta so
+        subsequent calls within ``min_interval_hours`` no-op only while that
+        policy is unchanged. Lowering ``retention_days`` therefore takes
+        effect on the next startup instead of being hidden by a recent sweep
+        made under the older policy. VACUUM has its own, typically longer,
+        throttle controlled by ``min_vacuum_interval_days`` so routine pruning
+        does not repeatedly rewrite the database. Designed to be called once
+        at startup from long-lived entrypoints (CLI, gateway, cron scheduler).
 
         When *sessions_dir* is provided, on-disk transcript files
         (``.json`` / ``.jsonl`` / ``request_dump_*``) for pruned sessions
@@ -14484,10 +14486,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
         try:
-            # Skip if another process/call did maintenance recently.
+            # Skip if another process/call did maintenance recently under the
+            # same retention policy.  The old timestamp-only marker could
+            # delay a newly tightened retention setting by up to a day.
             last_raw = self.get_meta("last_auto_prune")
+            policy_key = str(int(retention_days))
+            last_policy = self.get_meta("last_auto_prune_retention_days")
             now = time.time()
-            if last_raw:
+            if last_raw and last_policy == policy_key:
                 try:
                     last_ts = float(last_raw)
                     if now - last_ts < min_interval_hours * 3600:
@@ -14527,6 +14533,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Record the attempt even if pruned == 0, so we don't retry
             # every startup within the min_interval_hours window.
             self.set_meta("last_auto_prune", str(now))
+            self.set_meta("last_auto_prune_retention_days", policy_key)
 
             if pruned > 0:
                 logger.info(

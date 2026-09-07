@@ -3133,6 +3133,28 @@ class TestAutoMaintenance:
         assert second["pruned"] == 0
         assert db.get_session("old2") is not None  # untouched
 
+    def test_retention_change_bypasses_recent_marker(self, db):
+        self._make_old_ended(db, "old90", days_old=100)
+        first = db.maybe_auto_prune_and_vacuum(
+            retention_days=90, min_interval_hours=24
+        )
+        assert first["pruned"] == 1
+
+        # A tighter policy must take effect immediately even though the last
+        # maintenance run is still inside the normal throttle interval.
+        self._make_old_ended(db, "old14", days_old=20)
+        second = db.maybe_auto_prune_and_vacuum(
+            retention_days=14, min_interval_hours=24
+        )
+        assert second["skipped"] is False
+        assert second["pruned"] == 1
+        assert db.get_session("old14") is None
+
+        third = db.maybe_auto_prune_and_vacuum(
+            retention_days=14, min_interval_hours=24
+        )
+        assert third["skipped"] is True
+
 
 
 
