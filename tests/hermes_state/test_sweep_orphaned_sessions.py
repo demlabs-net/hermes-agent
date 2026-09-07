@@ -163,6 +163,23 @@ class TestSweepOrphanedSessions:
         assert db.get_session("stale-cli")["end_reason"] == "startup_orphan_reap"
         assert db.get_session("stale-tui")["ended_at"] is None
 
+    def test_api_server_can_be_swept_explicitly_after_gateway_restart(self, db):
+        stale = time.time() - 60
+        _make_session(
+            db,
+            "orphaned-api-run",
+            source="api_server",
+            started_at=stale,
+            message_at=stale,
+        )
+
+        assert db.sweep_orphaned_sessions(
+            max_idle_seconds=1, sources=("api_server",)
+        ) == ["orphaned-api-run"]
+        row = db.get_session("orphaned-api-run")
+        assert row["ended_at"] is not None
+        assert row["end_reason"] == "startup_orphan_reap"
+
     def test_returns_empty_on_empty_db(self, db):
         assert db.sweep_orphaned_sessions(max_idle_seconds=IDLE_S) == []
 
