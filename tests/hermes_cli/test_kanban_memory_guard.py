@@ -230,6 +230,20 @@ def test_dispatch_unknown_pressure_imposes_no_restriction(
     assert res.memory_pressure is None
 
 
+def test_empty_board_does_not_sample_or_log_memory_pressure(
+    kanban_home,
+    monkeypatch,
+):
+    def unexpected_probe():
+        raise AssertionError("empty board must not sample memory pressure")
+
+    monkeypatch.setattr(kb, "_memory_pressure_level", unexpected_probe)
+    with kb.connect() as conn:
+        result = kb.dispatch_once(conn)
+
+    assert result.memory_pressure is None
+
+
 def test_dispatch_critical_pressure_still_runs_reclaim_bookkeeping(
     kanban_home, all_assignees_spawnable, monkeypatch,
 ):

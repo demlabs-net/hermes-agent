@@ -7951,6 +7951,20 @@ class APIServerAdapter(BasePlatformAdapter):
                                         clear_session_vars(session_tokens)
                                     except Exception:
                                         pass
+                            # `/v1/runs` owns this per-run agent. Closing it in
+                            # the executor thread both releases its resources
+                            # and finalizes the SQLite session row; merely
+                            # dropping `_active_run_agents` left every run with
+                            # `ended_at IS NULL` and made state.db grow without
+                            # entering normal retention.
+                            try:
+                                agent.close()
+                            except Exception:
+                                logger.debug(
+                                    "[api_server] agent close failed for run=%s",
+                                    run_id,
+                                    exc_info=True,
+                                )
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

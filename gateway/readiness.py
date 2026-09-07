@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -10,10 +9,8 @@ from typing import Any
 
 import yaml
 
+from gateway.disk_status import collect_disk_status
 from hermes_constants import get_hermes_home
-
-
-_DISK_DEGRADED_PERCENT = 90.0
 
 
 def _check(status: str, detail: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -59,13 +56,19 @@ def _probe_config(home: Path) -> dict[str, Any]:
 
 
 def _probe_disk(home: Path) -> dict[str, Any]:
-    try:
-        usage = shutil.disk_usage(home)
-        used_pct = round((usage.used / usage.total) * 100, 1) if usage.total else 0.0
-        status = "degraded" if used_pct >= _DISK_DEGRADED_PERCENT else "ok"
-        return _check(status, used_percent=used_pct, free_bytes=usage.free)
-    except Exception as exc:
-        return _check("degraded", type(exc).__name__)
+    sample = collect_disk_status(home)
+    pressure = sample.get("pressure", "unknown")
+    status = "ok" if pressure == "ok" else "degraded"
+    return _check(
+        status,
+        pressure=pressure,
+        used_percent=sample.get("used_percent"),
+        free_bytes=(
+            int(sample["free_mb"]) * 1024 * 1024
+            if isinstance(sample.get("free_mb"), int)
+            else None
+        ),
+    )
 
 
 def _probe_gateway(runtime_status: dict[str, Any]) -> dict[str, Any]:

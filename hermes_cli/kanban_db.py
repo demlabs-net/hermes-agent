@@ -10009,6 +10009,25 @@ def _dispatch_once_locked(
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
 
+    ready_rows = conn.execute(
+        "SELECT id, assignee FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "ORDER BY priority DESC, created_at ASC"
+    ).fetchall()
+    # Review rows are enumerated up front (not after the ready loop) so the
+    # budget split below can see whether review work exists at all.
+    review_rows = []
+    if review_dispatch_enabled():
+        review_rows = conn.execute(
+            "SELECT id, assignee FROM tasks "
+            "WHERE status = 'review' AND claim_lock IS NULL "
+            "ORDER BY priority DESC, created_at ASC"
+        ).fetchall()
+    # An empty board has no spawn decision to make. Avoid sampling/logging
+    # host pressure every dispatcher tick when there is nothing to defer.
+    if not ready_rows and not review_rows:
+        return result
+
     # Memory-pressure guard (OOF-30/OOF-77): even a well-chosen static cap
     # can't see the host's actual memory state (other tenants, bloated
     # long-lived workers, dashboard growth). Under observed pressure the
@@ -10032,21 +10051,6 @@ def _dispatch_once_locked(
                 "limiting to at most 1 new worker this tick"
             )
             spawn_budget = 1
-
-    ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
-    # Review rows are enumerated up front (not after the ready loop) so the
-    # budget split below can see whether review work exists at all.
-    review_rows = []
-    if review_dispatch_enabled():
-        review_rows = conn.execute(
-            "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
-            "ORDER BY priority DESC, created_at ASC"
-        ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
     # first and used to consume the ENTIRE shared budget, so a sustained
     # ready backlog permanently starved autonomous reviews — completed work

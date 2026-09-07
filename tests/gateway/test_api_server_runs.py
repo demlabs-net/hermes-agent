@@ -258,6 +258,7 @@ class TestStartRun:
                 assert adapter.active_agent_work_count() == 0
                 assert run_id not in adapter._active_run_tasks
                 assert run_id not in adapter._active_run_agents
+                mock_agent.close.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_opt_in_reaps_run_owned_background_processes(self, adapter, monkeypatch):

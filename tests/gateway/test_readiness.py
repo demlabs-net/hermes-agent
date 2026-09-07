@@ -3,9 +3,27 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections import namedtuple
 from pathlib import Path
 
-from gateway.readiness import collect_runtime_readiness
+from gateway.readiness import _probe_disk, collect_runtime_readiness
+
+
+def test_readiness_disk_uses_absolute_headroom_not_percent_alone(
+    tmp_path, monkeypatch
+):
+    usage = namedtuple("usage", "total used free")
+    total = 300 * 1024**3
+    free = 16 * 1024**3
+    monkeypatch.setattr(
+        "gateway.disk_status.shutil.disk_usage",
+        lambda _path: usage(total, total - free, free),
+    )
+    result = _probe_disk(tmp_path)
+
+    assert result["used_percent"] > 90
+    assert result["pressure"] == "ok"
+    assert result["status"] == "ok"
 
 
 def test_collect_runtime_readiness_reports_healthy_local_runtime(tmp_path, monkeypatch):
@@ -91,5 +109,3 @@ def test_readiness_uses_running_session_store_state_over_independent_probe(
         },
     )
     assert recovered["checks"]["session_store"] == {"status": "ok"}
-
-
