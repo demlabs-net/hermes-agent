@@ -22,8 +22,9 @@ while [ "$attempt" -le "$attempts" ]; do
         --fetch-timeout=30000 \
         "$@"; then
         exit 0
+    else
+        status=$?
     fi
-    status=$?
     if [ "$attempt" -ge "$attempts" ]; then
         echo "npm-bounded failed after ${attempts} attempt(s), status ${status}" >&2
         exit "$status"
