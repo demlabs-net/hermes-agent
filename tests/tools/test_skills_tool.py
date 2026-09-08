@@ -357,6 +357,29 @@ class TestSkillView:
             session_id="session-view",
         )
 
+    def test_registered_view_recovers_model_added_suffix_for_exact_skill(self, tmp_path):
+        from tools.skills_tool import _skill_view_with_bump
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            recovered = json.loads(
+                _skill_view_with_bump(
+                    {"name": "my-skill toolong"},
+                    task_id="task-noisy-name",
+                )
+            )
+            unknown = json.loads(
+                _skill_view_with_bump(
+                    {"name": "missing-skill commentary"},
+                    task_id="task-unknown-name",
+                )
+            )
+
+        assert recovered["success"] is True
+        assert recovered["name"] == "my-skill"
+        assert unknown["success"] is False
+        assert "missing-skill commentary" in unknown["error"]
+
 
     def test_view_reference_files(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):

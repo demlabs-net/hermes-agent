@@ -2133,10 +2133,42 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
             _skill_view_tracker.pop(str(task_id), None)
 
 
+def _recover_noisy_skill_view_name(raw_name: Any) -> str:
+    """Recover an exact installed skill from a model-added whitespace suffix.
+
+    Some tool-calling models occasionally emit ``"skill-name commentary"``
+    even though the schema accepts only the name. Skill identifiers cannot
+    contain whitespace. We only trim such noise when the first token is an
+    exact advertised skill, keeping unknown and path-like inputs fail-closed.
+    """
+    name = str(raw_name or "").strip()
+    parts = name.split(maxsplit=1)
+    if len(parts) != 2:
+        return name
+    candidate = parts[0]
+    try:
+        payload = json.loads(skills_list())
+        available = {
+            str(skill.get("name"))
+            for skill in payload.get("skills", [])
+            if isinstance(skill, dict) and skill.get("name")
+        }
+    except Exception:
+        return name
+    if candidate not in available:
+        return name
+    logger.warning(
+        "Recovered noisy skill_view name %r as exact installed skill %r",
+        name,
+        candidate,
+    )
+    return candidate
+
+
 def _skill_view_with_bump(args, **kw):
     """Invoke skill_view, then bump view_count on success. Best-effort: a
     telemetry failure never breaks the tool call."""
-    name = args.get("name", "")
+    name = _recover_noisy_skill_view_name(args.get("name", ""))
     task_id = kw.get("task_id")
     # ── Repeat-view dedup ────────────────────────────────────────────
     # Mirrors read_file's unchanged-stub: when this session already
