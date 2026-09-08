@@ -7208,19 +7208,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._session_db is not None:
             try:
                 # A gateway restart destroys every per-request api_server
-                # agent.  Any still-open row therefore belongs to the old
-                # process and is no longer a live writer.  Normal run
-                # completion closes these rows in APIServerAdapter; this
-                # startup sweep covers SIGKILL, host reboot, and older builds
-                # that leaked them.  Ending a row keeps it resumable while
-                # allowing the normal retention policy to prune it later.
+                # agent and cron turn.  Any still-open row from either source
+                # therefore belongs to the old process and is no longer a
+                # live writer.  Normal completion closes these rows; this
+                # startup sweep covers SIGKILL, host reboot, and interrupted
+                # deploys.  Ending a row keeps it resumable while allowing the
+                # normal retention policy to prune it later.
                 _api_orphans = self._session_db._db.sweep_orphaned_sessions(
                     max_idle_seconds=1.0,
-                    sources=("api_server",),
+                    sources=("api_server", "cron"),
                 )
                 if _api_orphans:
                     logger.info(
-                        "Closed %d api_server session row(s) orphaned by a "
+                        "Closed %d api_server/cron session row(s) orphaned by a "
                         "previous gateway process",
                         len(_api_orphans),
                     )

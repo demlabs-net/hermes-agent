@@ -2134,18 +2134,15 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
 
 
 def _recover_noisy_skill_view_name(raw_name: Any) -> str:
-    """Recover an exact installed skill from a model-added whitespace suffix.
+    """Recover an exact installed skill from a model-added suffix.
 
     Some tool-calling models occasionally emit ``"skill-name commentary"``
-    even though the schema accepts only the name. Skill identifiers cannot
-    contain whitespace. We only trim such noise when the first token is an
-    exact advertised skill, keeping unknown and path-like inputs fail-closed.
+    or concatenate non-ASCII commentary directly after the identifier even
+    though the schema accepts only the name.  Recover only an exact advertised
+    ASCII skill prefix followed by whitespace or a non-ASCII boundary.  ASCII
+    identifier extensions and path-like inputs remain fail-closed.
     """
     name = str(raw_name or "").strip()
-    parts = name.split(maxsplit=1)
-    if len(parts) != 2:
-        return name
-    candidate = parts[0]
     try:
         payload = json.loads(skills_list())
         available = {
@@ -2155,14 +2152,23 @@ def _recover_noisy_skill_view_name(raw_name: Any) -> str:
         }
     except Exception:
         return name
-    if candidate not in available:
-        return name
-    logger.warning(
-        "Recovered noisy skill_view name %r as exact installed skill %r",
-        name,
-        candidate,
-    )
-    return candidate
+    for candidate in sorted(available, key=len, reverse=True):
+        if name == candidate:
+            return name
+        if not name.startswith(candidate):
+            continue
+        suffix = name[len(candidate) :]
+        if not suffix:
+            return name
+        boundary = suffix[0]
+        if boundary.isspace() or (candidate.isascii() and not boundary.isascii()):
+            logger.warning(
+                "Recovered noisy skill_view name %r as exact installed skill %r",
+                name,
+                candidate,
+            )
+            return candidate
+    return name
 
 
 def _skill_view_with_bump(args, **kw):

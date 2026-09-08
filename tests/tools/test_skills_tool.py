@@ -374,11 +374,27 @@ class TestSkillView:
                     task_id="task-unknown-name",
                 )
             )
+            unicode_joined = json.loads(
+                _skill_view_with_bump(
+                    {"name": "my-skillலifecycle."},
+                    task_id="task-unicode-noisy-name",
+                )
+            )
+            path_like = json.loads(
+                _skill_view_with_bump(
+                    {"name": "my-skill/references"},
+                    task_id="task-path-like-name",
+                )
+            )
 
         assert recovered["success"] is True
         assert recovered["name"] == "my-skill"
+        assert unicode_joined["success"] is True
+        assert unicode_joined["name"] == "my-skill"
         assert unknown["success"] is False
         assert "missing-skill commentary" in unknown["error"]
+        assert path_like["success"] is False
+        assert "my-skill/references" in path_like["error"]
 
 
     def test_view_reference_files(self, tmp_path):
