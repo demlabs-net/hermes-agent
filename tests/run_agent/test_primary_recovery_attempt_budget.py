@@ -25,6 +25,9 @@ def _agent() -> AIAgent:
             skip_memory=True,
         )
     agent._api_max_retries = 2
+    # Exercise the non-stream request seam. Streaming owns a separate
+    # interruptible call path after the upstream transport refactor.
+    agent._disable_streaming = True
     return agent
 
 

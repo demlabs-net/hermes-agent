@@ -62,4 +62,3 @@ Use this skill when conducting cold sales outreach for DemLabs services.
 - Day 2: Follow-up message
 - Day 7: Second follow-up
 - Day 14: Final attempt
-

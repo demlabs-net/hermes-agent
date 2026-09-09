@@ -73,8 +73,12 @@ def test_capable_provider_keeps_multimodal_tool_result_unchanged():
         supports_vision_tool_messages=True,
     )
 
-    assert result is messages
     assert isinstance(result[0]["content"], list)
+    assert result[0]["content"] == messages[0]["content"]
+    assert result[0]["tool_call_id"] == "a"
+    # The upstream transport now strips the internal-only tool name on every
+    # provider while preserving native multimodal content.
+    assert "name" not in result[0]
 
 
 def test_custom_provider_defaults_to_strict_tool_content():

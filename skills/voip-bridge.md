@@ -86,4 +86,3 @@ The MCP server provides the authoritative tag list.
 - `contactor` — male voice (Алексей), Fish Audio ID `4fc46239...`
 
 Set via `profile_id` in `make_call()`.
-

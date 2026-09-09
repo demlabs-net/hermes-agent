@@ -17,9 +17,17 @@ def test_external_state_is_packaged_as_a_top_level_module():
     explicitly; relying on the checkout as the current working directory makes
     container startup fail before the gateway changes into the repository.
     """
-    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    source = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    discover = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_root_py_modules"
+    )
+    namespace = {"os": __import__("os"), "_ROOT": str(REPO_ROOT)}
+    exec(compile(ast.Module(body=[discover], type_ignores=[]), "setup.py", "exec"), namespace)
 
-    assert "external_state" in data["tool"]["setuptools"]["py-modules"]
+    assert "external_state" in namespace["_root_py_modules"]()
 
 
 def _distribution_name(requirement: str) -> str:
@@ -299,6 +307,62 @@ def test_build_system_requires_exempt_from_exclude_newer():
     )
 
 
+def test_exact_pinned_deps_exempt_from_exclude_newer():
+    """Regression guard for the release-day brick class.
+
+    Every release exact-pins at least one dependency to a version published
+    days before the release (v0.20.6: snowballstemmer==3.1.1,
+    psutil==7.2.2). For two weeks after release the relative
+    ``exclude-newer`` cutoff filters those versions out, so any venv that
+    predates the release cannot resolve the new pins at all ("no version of
+    snowballstemmer==3.1.1" — observed 2026-08-29 updating three production
+    installs v0.20.0 -> v0.20.6, one Termux and two Linux servers). The pin
+    bump WAS the review, so the cutoff adds zero float protection for an
+    exact pin and can only brick.
+
+    Every exact-pinned package in [project].dependencies and
+    optional-dependencies must therefore appear in the
+    ``exclude-newer-package`` whitelist (set to ``false``) for as long as a
+    relative ``exclude-newer`` cutoff is configured.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    uv_cfg = data.get("tool", {}).get("uv", {})
+    if "exclude-newer" not in uv_cfg:
+        pytest.skip("no exclude-newer cutoff configured — nothing to exempt")
+    whitelist = {
+        _canonical(name)
+        for name, enabled in uv_cfg.get("exclude-newer-package", {}).items()
+        if enabled is False
+    }
+    missing = sorted(set(_pins_from_specs(_pyproject_pinned_specs())) - whitelist)
+    assert not missing, (
+        "exact-pinned packages are subject to the exclude-newer cutoff but "
+        "missing from the [tool.uv].exclude-newer-package whitelist — "
+        "release-day updates brick while the pinned version is younger than "
+        f"the cutoff: {missing}"
+    )
+
+
+
+def test_build_system_requires_wheel_for_isolated_builds():
+    """Regression for #96488 — PEP 517 isolation must include wheel.
+
+    ``setuptools.build_meta`` and our ``setup.py`` bdist_wheel guard import
+    ``wheel`` during editable builds. uv's build-isolation sandbox is seeded
+    only from ``[build-system].requires``; without ``wheel`` there, Windows
+    ``uv sync`` / ``uv pip install -e .`` fails with
+    ``ModuleNotFoundError: No module named 'wheel.cli'`` even when the real
+    venv already has wheel installed.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    names = {
+        _distribution_name(req)
+        for req in data.get("build-system", {}).get("requires", [])
+    }
+    assert "wheel" in names, (
+        "wheel must be listed in [build-system].requires so PEP 517 isolated "
+        "builds can import wheel.cli / bdist_wheel — see #96488"
+    )
 
 
 def _lazy_deps_by_feature():

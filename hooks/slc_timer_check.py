@@ -37,11 +37,11 @@ def get_due_reminders():
     })
     if "result" not in result:
         return []
-    
+
     content = result["result"].get("content", [])
     if not content:
         return []
-    
+
     text = content[0].get("text", "")
     # Parse reminders from text - look for due ones
     due = []
@@ -69,16 +69,16 @@ def get_active_tasks():
 def main():
     due_reminders = get_due_reminders()
     active_task = get_active_tasks()
-    
+
     output = []
     if due_reminders:
         output.append("🔔 DUE REMINDERS:")
         for r in due_reminders[:5]:
             output.append(f"  - {r}")
-    
+
     if active_task:
         output.append(f"📋 ACTIVE TASK: {active_task[:200]}")
-    
+
     if output:
         print("\n".join(output))
     else:

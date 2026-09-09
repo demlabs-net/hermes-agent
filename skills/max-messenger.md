@@ -64,4 +64,3 @@ Use this skill to send messages via MAX (Макс) messenger bot API.
 
 ## Sales Templates
 Use personalized templates for cold outreach.
-
