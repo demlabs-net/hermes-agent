@@ -376,6 +376,12 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
     _openai_error = _api_server._openai_error
+    # Operator stop: refuse before reserving an idempotency slot or run state, so a
+    # held gateway leaves no half-created run behind.
+    from agent.operator_hold import hold_message, is_held
+
+    if is_held():
+        return _json_error(_openai_error, hold_message(), code="operator_hold", status=503)
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
     if key_err is not None:

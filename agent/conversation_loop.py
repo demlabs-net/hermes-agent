@@ -1587,7 +1587,13 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
+    from agent.operator_hold import require_released
     from agent.turn_context import export_current_turn_boundary
+
+    # Single chokepoint for every envelope: cron fires, API-server runs and
+    # platform webhooks all reach this function, so one guard stops them all
+    # without stopping the container itself.
+    require_released("conversation turn")
 
     result = _run_conversation_turn(
         agent,

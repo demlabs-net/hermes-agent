@@ -2230,6 +2230,16 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # The stop is checked BEFORE _prepare_job_prompt, because that helper runs the
+    # job's own wake-gate script: a held job must not execute job-defined shell
+    # either, not merely skip the model turn afterwards.
+    from agent.operator_hold import hold_message, is_held
+
+    if is_held():
+        message = hold_message()
+        logger.warning("Job '%s': SKIPPED — %s", job_name, message)
+        return False, "", "", message
+
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early

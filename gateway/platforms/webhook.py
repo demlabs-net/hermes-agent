@@ -649,6 +649,14 @@ class WebhookAdapter(BasePlatformAdapter):
                              message_id=delivery_id)
         logger.info("[webhook] %s event=%s route=%s prompt_len=%d delivery=%s", request.method, event_type, route_name,
                     len(prompt), delivery_id)
+        # Operator stop: acknowledge with 503 instead of accepting a delivery that
+        # must not run. Nothing is queued, so nothing can replay after release.
+        from agent.operator_hold import hold_message, is_held
+
+        if is_held():
+            logger.warning("[webhook] rejected delivery=%s: %s", delivery_id, hold_message())
+            return web.json_response({"status": "held", "reason": hold_message(),
+                                      "route": route_name, "delivery_id": delivery_id}, status=503)
         # The per-delivery session is closed by ``on_processing_complete`` once the run finishes
         # (``handle_message`` is fire-and-forget, so nothing can be closed here).
         task = asyncio.create_task(self.handle_message(event))
