@@ -1,8 +1,9 @@
 ---
 name: max-messenger
-description: Integration with MAX (Макс) Russian messenger for sales outreach
+description: MAX messenger integration for sales outreach.
 version: 1.0.0
 author: DemLabs
+license: MIT
 platforms: [linux]
 metadata:
   hermes:

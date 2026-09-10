@@ -1,8 +1,13 @@
 ---
 name: voip-bridge
-description: Voice call control via voip-bridge MCP server
+description: Voice-call control through the VoIP Bridge MCP server.
 version: 1.2.0
 author: DemLabs
+license: MIT
+platforms: [linux]
+metadata:
+  hermes:
+    tags: [voip, calls, bridge, mcp]
 ---
 
 # VoIP Bridge

@@ -138,7 +138,13 @@ class VisionMessagePrepMixin:
             from agent.image_routing import _lookup_supports_vision
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
-            return _lookup_supports_vision(provider, model, load_config()) is True
+            requested_provider = (getattr(self, "requested_provider", "") or "").strip()
+            return _lookup_supports_vision(
+                provider,
+                model,
+                load_config(),
+                requested_provider=requested_provider,
+            ) is True
         except Exception:
             return False
 
@@ -146,10 +152,17 @@ class VisionMessagePrepMixin:
         """True if the active provider accepts list-type tool content (some, e.g. Xiaomi MiMo, take
         multimodal user messages but 400 on list-type tool content; profile ``supports_vision_tool_messages``)."""
         try:
-            from providers import get_provider_profile
-            profile = get_provider_profile((getattr(self, "provider", "") or "").strip())
-            if profile is not None:
-                return getattr(profile, "supports_vision_tool_messages", True)
+            from agent.image_routing import _lookup_supports_vision_tool_messages
+            from hermes_cli.config import load_config
+
+            return _lookup_supports_vision_tool_messages(
+                (getattr(self, "provider", "") or "").strip(),
+                (getattr(self, "model", "") or "").strip(),
+                load_config(),
+                requested_provider=(
+                    getattr(self, "requested_provider", "") or ""
+                ).strip(),
+            )
         except Exception:
             pass
         return True  # default: assume compatible

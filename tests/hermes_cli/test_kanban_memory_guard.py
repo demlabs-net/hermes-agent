@@ -240,8 +240,8 @@ def test_empty_board_does_not_sample_or_log_memory_pressure(
         raise AssertionError("empty board must not sample memory pressure")
 
     monkeypatch.setattr(kbd, "_memory_pressure_level", unexpected_probe)
-    with kb.connect() as conn:
-        result = kb.dispatch_once(conn)
+    with kbc.connect() as conn:
+        result = kbd.dispatch_once(conn)
 
     assert result.memory_pressure is None
 

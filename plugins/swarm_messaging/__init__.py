@@ -16,11 +16,13 @@ logger = logging.getLogger(__name__)
 def register(ctx) -> None:
     """Register send_message as a model-callable tool.
 
-    The handler and schema are reused verbatim from the built-in engine, so all
+    The handler is reused from the built-in engine and the stable plugin-local
+    schema exposes the same contract, so all
     target formats (telegram, telegram:<chat_id>, @username resolution, threads,
     media, reactions) work exactly as documented in send_message_tool.
     """
-    from tools.send_message_tool import SEND_MESSAGE_SCHEMA, send_message_tool
+    from plugins.swarm_messaging.schema import SEND_MESSAGE_SCHEMA
+    from tools.send_message_tool import send_message_tool
 
     ctx.register_tool(
         name="send_message",

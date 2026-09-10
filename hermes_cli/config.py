@@ -172,20 +172,48 @@ _CONFIG_LOCK = threading.RLock()
 # path -> last successfully loaded (expanded) config; served after a parse failure so a
 # mid-edit broken YAML never silently drops user overrides (e.g. approvals.deny rules).
 _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
-# path -> (user_mtime_ns, user_size, managed_mtime_ns, managed_size, merged, env_ref_snapshot).
+# A timestamp alone is not a safe cache key: rapid same-size rewrites can retain
+# the same mtime on coarse filesystems. Inode/ctime make both atomic replacement
+# and in-place edits observable.
+_FileCacheSignature = Tuple[int, int, int, int, int]
+_MergedConfigSignature = Tuple[_FileCacheSignature, _FileCacheSignature]
+
+
+def _file_cache_signature(stat_result: os.stat_result) -> _FileCacheSignature:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+# path -> (user/managed signatures, merged config, env-ref snapshot).
 # load_config() returns a deepcopy of the cached value while the signature matches (skips
 # safe_load + merge + normalize + expand, ~13 ms). Writers use atomic_yaml_write (fresh inode
 # -> new mtime_ns) so no explicit invalidation is needed. The managed-file signature is folded
 # in so editing the managed-scope config.yaml invalidates, and the env snapshot invalidates
 # when a referenced ${VAR} changes value (late .env load, in-process rotation).
-# (path, mtime_ns, size) -> cached expanded config dict. load_config() returns a deepcopy of the cached
-# value when the file hasn't changed since the last load, skipping yaml.safe_load + _deep_merge +
-# _normalize_* + _expand_env_vars (~13 ms/call). save_config() + migrate_config() write via
-# atomic_yaml_write which produces a fresh inode, so stat() sees a new mtime_ns and the next load
-# repopulates automatically — no explicit invalidation hook. See #58514.
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
-# path -> (mtime_ns, size, raw yaml dict) for read_raw_config() (no defaults merged in).
-_RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[_MergedConfigSignature, Dict[str, Any], Dict[str, Optional[str]]],
+] = {}
+# path -> (file signature, raw yaml dict) for read_raw_config() (no defaults merged in).
+_RAW_CONFIG_CACHE: Dict[str, Tuple[_FileCacheSignature, Dict[str, Any]]] = {}
+
+
+def invalidate_config_cache(config_path: Optional[Path] = None) -> None:
+    """Forget parsed config values for one path.
+
+    Stat signatures catch normal edits, but an explicit subsystem reset must
+    also work on filesystems that can preserve every exposed timestamp across
+    a rapid same-size in-place rewrite.
+    """
+    path_key = str(config_path or get_config_path())
+    with _CONFIG_LOCK:
+        _LOAD_CONFIG_CACHE.pop(path_key, None)
+        _RAW_CONFIG_CACHE.pop(path_key, None)
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1860,14 +1888,14 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         try:
             config_path = get_config_path()
             st = config_path.stat()
-            cache_key = (st.st_mtime_ns, st.st_size)
+            cache_key = _file_cache_signature(st)
         except (FileNotFoundError, OSError):
             return {}
 
         path_key = str(config_path)
         cached = _RAW_CONFIG_CACHE.get(path_key)
-        if cached is not None and cached[:2] == cache_key:
-            return copy.deepcopy(cached[2]) if want_deepcopy else cached[2]
+        if cached is not None and cached[0] == cache_key:
+            return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         try:
             with open(config_path, encoding="utf-8") as f:
@@ -1881,13 +1909,14 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # The cache stores its own deepcopy. The readonly path returns THAT object (identity
         # invariant: later cache hits return the same dict); the mutable path returns the parse.
         cached_copy = copy.deepcopy(data)
-        _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], cached_copy)
+        _RAW_CONFIG_CACHE[path_key] = (cache_key, cached_copy)
         return data if want_deepcopy else cached_copy
 
 
 def read_raw_config() -> Dict[str, Any]:
     """Read config.yaml as-is (no defaults merged, no migration); ``{}`` if missing/unparseable.
-    Cached on (mtime_ns, size); returns a deepcopy since callers mutate before ``save_config()``."""
+    Cached on a strong file-stat signature; returns a deepcopy since callers mutate before
+    ``save_config()``."""
     return _read_raw_config_impl(want_deepcopy=True)
 
 
@@ -2086,24 +2115,26 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_cache_sig(config_path: Path) -> Tuple[Optional[Tuple[int, int]], Optional[Tuple[int, int, int, int]]]:
+def _load_config_cache_sig(
+    config_path: Path,
+) -> Tuple[Optional[_FileCacheSignature], Optional[_MergedConfigSignature]]:
     """Return ``(user_sig, cache_sig)`` for ``_LOAD_CONFIG_CACHE``.
-    The managed config file's (mtime, size) is folded in ((0, 0) = none) so editing it invalidates
+    The managed config file's stat signature is folded in (all-zero = none) so editing it invalidates
     the merged result. ``cache_sig`` is None only when neither file exists (nothing to cache on)."""
     try:
         st = config_path.stat()
-        user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
+        user_sig: Optional[_FileCacheSignature] = _file_cache_signature(st)
     except FileNotFoundError:
         user_sig = None
     managed_dir = managed_scope.get_managed_dir()
     try:
         mst = (managed_dir / "config.yaml").stat() if managed_dir else None
-        managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+        managed_sig = _file_cache_signature(mst) if mst else (0, 0, 0, 0, 0)
     except OSError:
-        managed_sig = (0, 0)
-    if user_sig is None and managed_sig == (0, 0):
+        managed_sig = (0, 0, 0, 0, 0)
+    if user_sig is None and managed_sig == (0, 0, 0, 0, 0):
         return None, None
-    return user_sig, (*(user_sig or (0, 0)), *managed_sig)
+    return user_sig, (user_sig or (0, 0, 0, 0, 0), managed_sig)
 
 
 def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: Exception) -> Optional[Dict[str, Any]]:
@@ -2126,7 +2157,7 @@ def _last_known_good_fallback(config_path: Path, path_key: str, cache_sig, exc: 
     if cache_sig is not None:
         # Cache under the corrupt file's signature (empty env snapshot: always valid) so repeated
         # loads don't re-parse; fixing the file changes the signature and reloads normally.
-        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, {})
+        _LOAD_CONFIG_CACHE[path_key] = (cache_sig, lkg_copy, {})
     return lkg_copy
 
 
@@ -2157,15 +2188,15 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         user_sig, cache_sig = _load_config_cache_sig(config_path)
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cache_sig is not None and cached[0] == cache_sig:
             # Signatures match, but the cached expansion is only valid if every ${VAR} it was
             # expanded against still has the same value — otherwise a load before
             # load_hermes_dotenv() pins unexpanded literals for the process lifetime.
             # Without this, a load_config() that ran before load_hermes_dotenv() pins unexpanded literals
             # (e.g. auxiliary.<task>.api_key) for the life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[2]
             if all(_env_ref_lookup(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[1]) if want_deepcopy else cached[1]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -2198,7 +2229,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             env_snapshot = _env_ref_snapshot(normalized)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+            _LOAD_CONFIG_CACHE[path_key] = (cache_sig, cached_copy, env_snapshot)
             # Readonly path returns the same object later calls will see (identity invariant).
             if not want_deepcopy:
                 return cached_copy

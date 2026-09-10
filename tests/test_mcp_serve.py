@@ -1291,7 +1291,7 @@ class TestEventBridgePollE2E:
         sessions_dir.mkdir()
         monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
 
-        # _poll_once reads <HERMES_HOME>/state.db for its mtime gate; the autouse
+        # _poll_once reads <HERMES_HOME>/state.db for its change gate; the autouse
         # fixture points HERMES_HOME at tmp_path.
         db_path = tmp_path / "state.db"
         db_path.write_text("placeholder")
@@ -1321,10 +1321,10 @@ class TestEventBridgePollE2E:
                 }]
 
         bridge = mcp_serve.EventBridge()
-        # Bridge has never seen this db state (mtime differs) and has an
+        # Bridge has never seen this db state (signature differs) and has an
         # empty cached index — exactly the state after a new conversation's
         # first write.
-        bridge._state_db_mtime = 0.0
+        bridge._state_db_signature = ((0, 0, 0, 0, 0), (0, 0, 0, 0, 0))
         assert bridge._cached_sessions_index == {}
 
         bridge._poll_once(DB())
@@ -1374,7 +1374,9 @@ class TestEventBridgePollE2E:
             "id": 2, "role": "assistant", "content": "arrived after start",
             "timestamp": "2026-03-29T15:05:00",
         })
-        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        # The in-memory DB double cannot change SQLite files itself, so mirror
+        # a committed main-file write with a real content change.
+        db_path.write_text("placeholder changed")
         bridge._poll_once(DB())
         events = bridge.poll_events(after_cursor=0)["events"]
         assert len(events) == 1
@@ -1412,7 +1414,9 @@ class TestEventBridgePollE2E:
             "id": 1, "role": "user", "content": "hello after baseline",
             "timestamp": "2026-03-29T15:10:00",
         }]
-        os.utime(db_path, None)
+        # In WAL mode the main database may remain unchanged until checkpoint.
+        # The bridge must still notice the transaction file.
+        (tmp_path / "state.db-wal").write_text("new transaction")
         bridge._poll_once(DB())
 
         events = bridge.poll_events(after_cursor=0)["events"]

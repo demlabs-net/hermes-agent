@@ -49,11 +49,28 @@ def _get_sessions_dir() -> Path:
     return _hermes_home() / "sessions"
 
 
-def _read_state_db_mtime() -> float:
+def _path_change_signature(path: Path) -> tuple[int, int, int, int, int]:
     try:
-        return (_hermes_home() / "state.db").stat().st_mtime
+        st = path.stat()
+        return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
     except OSError:  # missing file included
-        return 0.0
+        return (0, 0, 0, 0, 0)
+
+
+def _read_state_db_signature() -> tuple[
+    tuple[int, int, int, int, int], tuple[int, int, int, int, int]
+]:
+    """Change signature for SQLite's main file and WAL.
+
+    WAL transactions need not update ``state.db`` until checkpoint, while a
+    float mtime can also miss rapid writes. Watching both files with nanosecond
+    stat metadata keeps the cheap polling gate without dropping events.
+    """
+    db_path = _hermes_home() / "state.db"
+    return (
+        _path_change_signature(db_path),
+        _path_change_signature(Path(f"{db_path}-wal")),
+    )
 
 
 def _read_json(path: Path):
@@ -275,7 +292,9 @@ class EventBridge:
         self._thread: Optional[threading.Thread] = None
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
         self._pending_approvals: Dict[str, dict] = {}  # populated from events
-        self._state_db_mtime: float = 0.0  # skip polling work when state.db is unchanged
+        # Zero lets tests and callers that drive _poll_once directly observe
+        # the first state. start() replaces it with a no-replay baseline.
+        self._state_db_signature = ((0, 0, 0, 0, 0), (0, 0, 0, 0, 0))
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -351,14 +370,14 @@ class EventBridge:
         self._new_event.set()
 
     def _establish_baseline(self) -> None:
-        """Record per-session latest timestamps and the state.db mtime WITHOUT
+        """Record per-session latest timestamps and the state.db signature WITHOUT
         emitting events. Only sessions existing now are baselined; later ones
         default to last_seen=0.0 in _poll_once, so their first message is delivered."""
         db = _get_session_db()
         if not db:
             return
         try:
-            self._state_db_mtime = _read_state_db_mtime()
+            self._state_db_signature = _read_state_db_signature()
             try:
                 self._cached_sessions_index = _load_sessions_index()
             except Exception:
@@ -395,17 +414,17 @@ class EventBridge:
     def _poll_once(self, db):
         """Check for new messages across all sessions.
 
-        One state.db mtime check gates all work, making 200ms polling nearly free.
+        One state.db/WAL stat check gates all work, making 200ms polling nearly free.
         The routing index lives in the same file as the messages, so a new
         conversation and its first message land under a single mtime change (no
         dual-file race that could drop brand-new conversations).
 
         See #8925, #9006.
         """
-        db_mtime = _read_state_db_mtime()
-        if db_mtime == self._state_db_mtime:
+        db_signature = _read_state_db_signature()
+        if db_signature == self._state_db_signature:
             return
-        self._state_db_mtime = db_mtime
+        self._state_db_signature = db_signature
         # Refresh the index on every change tick: one indexed query, never lags messages.
         self._cached_sessions_index = _load_sessions_index()
 

@@ -4,6 +4,7 @@ import sqlite3
 import time
 import json
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -903,7 +904,7 @@ class TestFTS5Search:
         ]
         assert all("context" in row and row["context"] for row in default)
 
-    def test_search_projection_skips_context_enrichment_queries(self, db):
+    def test_search_projection_skips_context_enrichment_queries(self, db, monkeypatch):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="before")
         db.append_message("s1", role="assistant", content="projectionneedle")
@@ -911,11 +912,15 @@ class TestFTS5Search:
 
         statements = []
         read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+        read_conn.set_trace_callback(statements.append)
+
+        @contextmanager
+        def traced_read_ctx():
+            yield read_conn
+
+        # WAL searches may check out any pooled reader. Pin this test to the
+        # traced connection so query-count assertions observe the real SQL.
+        monkeypatch.setattr(db, "_read_ctx", traced_read_ctx)
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
@@ -940,8 +945,9 @@ class TestFTS5Search:
             assert default[0]["context"]
             assert context_query_count() == 2
         finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+            read_conn.set_trace_callback(None)
+            if read_conn is not db._conn:
+                db._close_read_conn(read_conn)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""

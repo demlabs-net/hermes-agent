@@ -1,8 +1,9 @@
 ---
 name: sip-calls
-description: SIP/VoIP voice calls via local Asterisk PBX
+description: SIP and VoIP calls through the local Asterisk PBX.
 version: 1.1.0
 author: DemLabs
+license: MIT
 platforms: [linux]
 metadata:
   hermes:

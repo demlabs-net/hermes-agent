@@ -1,8 +1,9 @@
 ---
 name: faracrm
-description: FaraCRM data model and CRM tools usage. Explains the difference between company (компания), partner (контактное лицо), contact (средство связи) and contact_type (тип контакта), leads and their funnel stages. Use before creating or updating CRM records.
+description: FaraCRM data model and CRM tool guidance.
 version: 1.0.0
 author: DemLabs
+license: MIT
 platforms: [linux]
 metadata:
   hermes:

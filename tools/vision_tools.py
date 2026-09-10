@@ -414,7 +414,13 @@ _TOOL_RESULT_MEDIA_PROVIDERS = frozenset({
 _GEMINI_PROVIDERS = frozenset({"google", "gemini", "google-gemini", "google-vertex-gemini"})
 
 
-def _profile_rejects_tool_media(provider: str) -> bool:
+def _profile_rejects_tool_media(
+    provider: str,
+    model: str = "",
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    requested_provider: str = "",
+) -> bool:
     """Hard veto: the provider's ``ProviderProfile`` declares
     ``supports_vision_tool_messages=False`` — images are accepted in user
     messages but list-type tool-result content is rejected with 400
@@ -423,20 +429,35 @@ def _profile_rejects_tool_media(provider: str) -> bool:
     and the image never enters context (#89981).
     """
     try:
-        from providers import get_provider_profile
-        profile = get_provider_profile(str(provider or "").strip().lower())
-        return profile is not None and profile.supports_vision_tool_messages is False
+        from agent.image_routing import _lookup_supports_vision_tool_messages
+
+        return not _lookup_supports_vision_tool_messages(
+            provider,
+            model,
+            cfg,
+            requested_provider=requested_provider,
+        )
     except Exception:
         return False
 
 
-def _supports_media_in_tool_results(provider: str, model: str) -> bool:
+def _supports_media_in_tool_results(
+    provider: str,
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    requested_provider: str = "",
+) -> bool:
     """Whether provider+model accepts image content inside a tool-result message. Unknown
     providers are False (caller falls back to aux-LLM text) unless their ``ProviderProfile``
     declares ``supports_vision``; ``supports_vision_tool_messages=False`` is a hard veto."""
     p = provider.strip().lower() if isinstance(provider, str) else ""
-    if not p or _profile_rejects_tool_media(p):
+    if not p or _profile_rejects_tool_media(
+        p, model, cfg, requested_provider=requested_provider
+    ):
         return False
+    if p == "custom" and requested_provider.strip().lower().startswith("custom:"):
+        return True
     if p in _TOOL_RESULT_MEDIA_PROVIDERS:
         return True
     if p in _GEMINI_PROVIDERS:
@@ -455,22 +476,44 @@ def _should_use_native_vision_fast_path() -> bool:
     results, or the user set the ``model.supports_vision`` override (escape hatch for
     custom/local providers). Any failure → False."""
     try:
-        from agent.auxiliary_client import _read_main_provider, _read_main_model
+        from agent.auxiliary_client import (
+            _read_main_model,
+            _read_main_provider,
+            _read_main_requested_provider,
+        )
         from agent.image_routing import decide_image_input_mode, _lookup_supports_vision
         from hermes_cli.config import load_config
         provider = _read_main_provider()
+        requested_provider = _read_main_requested_provider()
         model = _read_main_model()
         cfg = load_config()
-        if decide_image_input_mode(provider, model, cfg) != "native":
+        if decide_image_input_mode(
+            provider, model, cfg, requested_provider=requested_provider
+        ) != "native":
             return False
         # The profile veto applies ahead of the capability lookup too: a
         # model marked vision-capable by models.dev / custom_providers must
         # not re-open the multimodal-envelope route the profile rejects.
-        if _profile_rejects_tool_media(provider):
+        if _profile_rejects_tool_media(
+            provider,
+            model,
+            cfg,
+            requested_provider=requested_provider,
+        ):
             return False
         return (
-            _supports_media_in_tool_results(provider, model)
-            or _lookup_supports_vision(provider, model, cfg) is True)
+            _supports_media_in_tool_results(
+                provider,
+                model,
+                cfg,
+                requested_provider=requested_provider,
+            )
+            or _lookup_supports_vision(
+                provider,
+                model,
+                cfg,
+                requested_provider=requested_provider,
+            ) is True)
     except Exception as exc:
         logger.debug("Native vision fast-path check failed: %s", exc)
         return False

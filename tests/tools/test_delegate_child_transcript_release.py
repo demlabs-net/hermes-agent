@@ -18,7 +18,7 @@ from __future__ import annotations
 import gc
 import json
 import weakref
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent.subagent_lifecycle import (
     _ACTIVE_PARENT_AGENT,
@@ -37,6 +37,16 @@ def _bare_agent() -> AIAgent:
     agent._session_db = None
     agent.session_id = "child-x"
     return agent
+
+
+def test_mock_parent_db_path_cannot_create_a_session_store():
+    """A partial parent double must not turn its fabricated path into a DB."""
+    from tools.delegate_tool import _open_child_session_db
+
+    parent = MagicMock()
+    with patch("hermes_state_registry.acquire") as acquire:
+        assert _open_child_session_db(parent) is None
+    acquire.assert_not_called()
 
 
 def test_close_releases_transcript_shadow_copies():

@@ -165,6 +165,39 @@ def _supports_vision_override(
     return next((v for v in (_model_supports_vision_override(m, model) for m in model_maps) if v is not None), None)
 
 
+def _supports_vision_tool_messages_override(
+    cfg: Optional[Dict[str, Any]],
+    provider: str,
+    model: str,
+    *,
+    requested_provider: str = "",
+) -> Optional[bool]:
+    """Resolve an explicit per-model tool-result image capability override."""
+    if not isinstance(cfg, dict):
+        return None
+    model_cfg = _dict_or_empty(cfg.get("model"))
+    top = _coerce_capability_bool(model_cfg.get("supports_vision_tool_messages"))
+    if top is not None:
+        return top
+
+    candidates: List[str] = []
+    for candidate in filter(None, (requested_provider, provider, _clean_str(model_cfg.get("provider")))):
+        candidates.append(candidate)
+        if candidate.startswith("custom:") and candidate[len("custom:"):]:
+            candidates.append(candidate[len("custom:"):])
+    candidates = list(dict.fromkeys(candidates))
+
+    providers_cfg = _dict_or_empty(cfg.get("providers"))
+    model_maps = [_dict_or_empty(providers_cfg.get(p)).get("models") for p in candidates]
+    model_maps += [entry.get("models") for entry in _custom_provider_entries(cfg, candidates)]
+    for models_cfg in model_maps:
+        per_model = _dict_or_empty(_dict_or_empty(models_cfg).get(model))
+        value = _coerce_capability_bool(per_model.get("supports_vision_tool_messages"))
+        if value is not None:
+            return value
+    return None
+
+
 def _resolve_inference_value(
     cfg: Optional[Dict[str, Any]],
     provider: str,
@@ -350,6 +383,58 @@ def _lookup_supports_vision(
         if verdict is not None:
             return verdict
     return None
+
+
+def _lookup_supports_vision_tool_messages(
+    provider: str,
+    model: str,
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    requested_provider: str = "",
+) -> bool:
+    """Whether the active route accepts image parts in tool-result messages.
+
+    Provider-specific vetoes such as Xiaomi stay closed. For ``custom`` routes,
+    an explicit ``supports_vision_tool_messages`` setting wins; a named custom
+    route that explicitly declared ``supports_vision`` also keeps its
+    pre-profile behavior for backward compatibility. The conservative generic
+    ``custom`` profile remains false.
+    """
+    if (
+        not requested_provider
+        and _runtime_main("provider").lower() == _clean_str(provider).lower()
+        and _runtime_main("model") == _clean_str(model)
+    ):
+        requested_provider = _runtime_main("requested_provider")
+
+    normalized_provider = _clean_str(provider).lower()
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized_provider)
+    except Exception:
+        profile = None
+    if (
+        profile is not None
+        and profile.supports_vision_tool_messages is False
+        and normalized_provider != "custom"
+    ):
+        return False
+
+    override = _supports_vision_tool_messages_override(
+        cfg, normalized_provider, model, requested_provider=requested_provider
+    )
+    if override is not None:
+        return override
+    if (
+        normalized_provider == "custom"
+        and _clean_str(requested_provider).lower().startswith("custom:")
+        and _supports_vision_override(
+            cfg, provider, model, requested_provider=requested_provider
+        ) is True
+    ):
+        return True
+    return bool(getattr(profile, "supports_vision_tool_messages", True))
 
 
 def decide_image_input_mode(

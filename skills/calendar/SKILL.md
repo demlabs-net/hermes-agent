@@ -1,8 +1,9 @@
 ---
 name: calendar
-description: Shared calendar and scheduling via SLC knowledge base
+description: Calendar and scheduling through the SLC knowledge base.
 version: 1.0.0
 author: DemLabs
+license: MIT
 platforms: [linux]
 metadata:
   hermes:

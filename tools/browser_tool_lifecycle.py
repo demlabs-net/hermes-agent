@@ -688,6 +688,14 @@ def cleanup_all_browsers() -> None:
         pass
 
     _install._discover_homebrew_node_dirs.cache_clear()
+    # Browser policy is config-backed. An explicit lifecycle reset promises a
+    # fresh read even after a rapid same-size manual config edit.
+    try:
+        from hermes_cli.config import invalidate_config_cache
+
+        invalidate_config_cache()
+    except Exception:
+        pass
     # Each resolved flag flips BEFORE its cache is nulled so a concurrent reader never
     # sees ``resolved=True`` with ``cache=None``.
     for flag, cache in (

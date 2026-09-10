@@ -6,13 +6,14 @@ snapshot, model migrations) goes through :func:`backup_config`. Copies live in
 never nest — as ``config.yaml.<reason>.<YYYYMMDD-HHMMSS>``. A copy identical to the newest one
 for the same reason is skipped, and only the newest ``keep`` per reason survive, so repeated
 ``hermes setup`` runs or a gateway restarting against broken YAML cannot litter the home dir.
+Same-second changes receive a monotonic numeric suffix instead of silently losing the backup.
 """
 
 from __future__ import annotations
 
-import filecmp
 import logging
 import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 BACKUPS_SUBDIR = Path("backups") / "config"
 DEFAULT_KEEP = 5
+_BACKUP_LOCK = threading.Lock()
 
 # Names earlier code wrote next to config.yaml (setup wizard, corrupt snapshot, xai migration).
 # Moved into the backups dir on first use so they stop accumulating in the home root; hand-named
@@ -42,12 +44,31 @@ def list_config_backups(config_path: Path, reason: Optional[str] = None) -> list
                   key=lambda p: p.name, reverse=True)
 
 
+def _files_identical(left: Path, right: Path) -> bool:
+    """Compare current bytes without ``filecmp``'s stale stat-keyed cache."""
+    if left.stat().st_size != right.stat().st_size:
+        return False
+    with left.open("rb") as left_file, right.open("rb") as right_file:
+        while True:
+            left_chunk = left_file.read(1024 * 1024)
+            right_chunk = right_file.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
 def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -> Optional[Path]:
     """Copy *config_path* to the backups dir; return the new path, or None when skipped/failed.
 
     Skips when the file is missing/empty, or when the newest backup for *reason* already holds
     identical bytes. Never raises: a failed backup must not block the write it precedes.
     """
+    with _BACKUP_LOCK:
+        return _backup_config_unlocked(config_path, reason, keep=keep)
+
+
+def _backup_config_unlocked(config_path: Path, reason: str, *, keep: int) -> Optional[Path]:
     try:
         if not config_path.is_file() or config_path.stat().st_size == 0:
             return None
@@ -55,12 +76,27 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         root.mkdir(parents=True, exist_ok=True)
         _sweep_legacy_siblings(config_path, root)
         existing = list_config_backups(config_path, reason)
-        if existing and filecmp.cmp(config_path, existing[0], shallow=False):
+        if existing and _files_identical(config_path, existing[0]):
             return None
-        dest = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
-        if dest.is_symlink() or dest.exists():  # never write through a planted link
+        base = root / f"{config_path.name}.{reason}.{time.strftime('%Y%m%d-%H%M%S')}"
+        dest = None
+        for sequence in range(1000):
+            candidate = base if sequence == 0 else Path(f"{base}.{sequence:03d}")
+            try:
+                # Exclusive creation prevents a concurrent process from making
+                # us overwrite a backup or follow a planted symlink.
+                with config_path.open("rb") as source, candidate.open("xb") as target:
+                    shutil.copyfileobj(source, target)
+                shutil.copystat(config_path, candidate, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            except Exception:
+                candidate.unlink(missing_ok=True)
+                raise
+            dest = candidate
+            break
+        if dest is None:
             return None
-        shutil.copy2(config_path, dest)
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)
         return dest

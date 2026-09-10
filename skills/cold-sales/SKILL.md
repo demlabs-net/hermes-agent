@@ -1,8 +1,9 @@
 ---
 name: cold-sales
-description: Cold sales outreach for DemLabs services in Novosibirsk region
+description: Cold-sales outreach for DemLabs in Novosibirsk.
 version: 1.0.0
 author: DemLabs
+license: MIT
 platforms: [linux]
 metadata:
   hermes:

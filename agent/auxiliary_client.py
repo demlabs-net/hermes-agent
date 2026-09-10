@@ -2298,6 +2298,9 @@ def _read_main_field(field: str, *, readonly: bool, lower: bool = False) -> str:
 # api_key/base_url read the full config so ``custom`` aux tasks can inherit main creds.
 _read_main_model = functools.partial(_read_main_field, "model", readonly=True)
 _read_main_provider = functools.partial(_read_main_field, "provider", readonly=True, lower=True)
+_read_main_requested_provider = functools.partial(
+    _read_main_field, "requested_provider", readonly=True, lower=True
+)
 _read_main_api_key = functools.partial(_read_main_field, "api_key", readonly=False)
 _read_main_base_url = functools.partial(_read_main_field, "base_url", readonly=False)
 

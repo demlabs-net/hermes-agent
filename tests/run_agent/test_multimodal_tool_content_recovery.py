@@ -152,7 +152,6 @@ class TestToolResultContentShortCircuit:
         assert "image_url" not in out
 
 
-
     def test_missing_cache_attribute_falls_through(self, monkeypatch):
         """Agents built via ``object.__new__`` without calling ``__init__``
         must not crash — the cache attribute may be absent. Xiaomi still
@@ -234,4 +233,3 @@ class TestOpenCodeGoProactiveToolResultDowngrade:
         assert isinstance(out, str)
         assert "data:image" not in out
         assert "image_url" not in out
-

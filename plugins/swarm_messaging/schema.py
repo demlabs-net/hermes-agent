@@ -1,0 +1,71 @@
+"""Stable model-facing schema for the swarm ``send_message`` tool."""
+
+from __future__ import annotations
+
+
+SEND_MESSAGE_SCHEMA = {
+    "name": "send_message",
+    "description": (
+        "Send a message to a connected messaging platform, or list available targets.\n\n"
+        "IMPORTANT: When the user asks to send to a specific channel or person "
+        "(not just a bare platform name), call send_message(action='list') FIRST to see "
+        "available targets, then send to the correct one.\n"
+        "If the user just says a platform name like 'send to telegram', send directly "
+        "to the home channel without listing first."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["send", "list", "react", "unreact"],
+                "description": (
+                    "Action to perform. 'send' (default) sends a message. 'list' returns all "
+                    "available channels/contacts across connected platforms. 'react' attaches "
+                    "an emoji reaction to a message (platforms that support it, e.g. "
+                    "photon/iMessage tapbacks). 'unreact' retracts a previously-added reaction."
+                ),
+            },
+            "target": {
+                "type": "string",
+                "description": (
+                    "Delivery target. Format: 'platform' (uses home channel), "
+                    "'platform:#channel-name', 'platform:chat_id', or "
+                    "'platform:chat_id:thread_id' for Telegram topics and Discord threads. "
+                    "Examples: 'telegram', 'telegram:-1001234567890:17585', "
+                    "'discord:999888777:555444333', 'discord:#bot-home', "
+                    "'slack:#engineering', 'signal:+155****4567', "
+                    "'matrix:!roomid:server.org', 'matrix:@user:server.org', "
+                    "'ntfy:alerts-channel' (explicit ntfy topic), "
+                    "'yuanbao:direct:<account_id>' (DM), "
+                    "'yuanbao:group:<group_code>' (group chat)"
+                ),
+            },
+            "message": {
+                "type": "string",
+                "description": (
+                    "The message text to send. To send an image or file, include "
+                    "MEDIA:<local_path> (e.g. 'MEDIA:/tmp/report.pdf') in the message — "
+                    "the platform will deliver it as a native media attachment."
+                ),
+            },
+            "emoji": {
+                "type": "string",
+                "description": (
+                    "For action='react': the emoji to react with (e.g. '❤️'). On iMessage, "
+                    "❤️👍👎😂‼️❓ render as native tapbacks; other emoji use custom-emoji "
+                    "reactions."
+                ),
+            },
+            "message_id": {
+                "type": "string",
+                "description": (
+                    "For action='react'/'unreact': id of the message to react to. Omit to "
+                    "target the most recent message received in that chat (usually the one "
+                    "being replied to)."
+                ),
+            },
+        },
+        "required": [],
+    },
+}

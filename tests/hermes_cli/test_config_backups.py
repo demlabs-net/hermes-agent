@@ -38,3 +38,19 @@ def test_legacy_siblings_move_but_user_named_copies_stay(tmp_path: Path):
     assert (root / "config.yaml.corrupt.20260729-093706.bak").exists()
     assert (tmp_path / "config.yaml.bak-my-note").read_text() == "mine"
     assert not list(tmp_path.glob("config.yaml.bak.*")) and not list(tmp_path.glob("config.yaml.corrupt.*"))
+
+
+def test_changed_config_in_same_second_gets_a_distinct_backup(tmp_path: Path, monkeypatch):
+    cfg = tmp_path / "config.yaml"
+    monkeypatch.setattr(
+        "hermes_cli.config_backups.time.strftime", lambda _fmt: "20260101-000000"
+    )
+
+    cfg.write_text("model: first\n")
+    first = backup_config(cfg, "pre-setup")
+    cfg.write_text("model: other\n")
+    second = backup_config(cfg, "pre-setup")
+
+    assert first is not None and second is not None and first != second
+    assert first.read_text() == "model: first\n"
+    assert second.read_text() == "model: other\n"

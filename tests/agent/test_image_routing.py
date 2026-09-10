@@ -12,6 +12,7 @@ from agent.image_routing import (
     _coerce_mode,
     _explicit_aux_vision_override,
     _lookup_supports_vision,
+    _lookup_supports_vision_tool_messages,
     _should_probe_ollama_vision,
     _supports_vision_override,
     build_native_content_parts,
@@ -585,6 +586,41 @@ class TestCustomProviderVisionAlias:
             ]
         }
         assert _supports_vision_override(cfg, "custom:my-vllm", "other") is None
+
+    def test_named_custom_vision_keeps_legacy_tool_message_support(self):
+        cfg = {
+            "providers": {
+                "my-vllm": {
+                    "models": {"llava": {"supports_vision": True}}
+                }
+            }
+        }
+        assert _lookup_supports_vision_tool_messages(
+            "custom", "llava", cfg, requested_provider="custom:my-vllm"
+        ) is True
+
+    def test_explicit_tool_message_veto_wins_for_named_custom(self):
+        cfg = {
+            "providers": {
+                "my-vllm": {
+                    "models": {
+                        "llava": {
+                            "supports_vision": True,
+                            "supports_vision_tool_messages": False,
+                        }
+                    }
+                }
+            }
+        }
+        assert _lookup_supports_vision_tool_messages(
+            "custom", "llava", cfg, requested_provider="custom:my-vllm"
+        ) is False
+
+    def test_provider_hard_veto_cannot_be_reopened_by_config(self):
+        cfg = {"model": {"supports_vision_tool_messages": True}}
+        assert _lookup_supports_vision_tool_messages(
+            "xiaomi", "mimo-v2.5", cfg
+        ) is False
 
 
 def _fake_key(tag: str) -> str:

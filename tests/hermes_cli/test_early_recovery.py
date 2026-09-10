@@ -111,7 +111,13 @@ def test_early_recovery_module_is_stdlib_only(tmp_path):
             import builtins
             import sys
 
-            STDLIB = set(sys.stdlib_module_names) | {"hermes_cli"}
+            # importlib's frozen implementation imports these private module
+            # names even though some Python builds omit them from
+            # sys.stdlib_module_names.
+            STDLIB = set(sys.stdlib_module_names) | {
+                "hermes_cli", "_bootstrap", "_bootstrap_external",
+                "_frozen_importlib", "_frozen_importlib_external",
+            }
             real_import = builtins.__import__
 
             def guard(name, *args, **kwargs):
@@ -535,7 +541,6 @@ def test_bump_marker_attempts_handles_missing_and_corrupt_bodies(tmp_path):
 
     m.write_text('{"attempts": 2}', encoding="utf-8")
     assert ir.bump_marker_attempts(m) == 3
-
 
 
 
