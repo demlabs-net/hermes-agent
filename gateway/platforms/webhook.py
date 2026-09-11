@@ -576,6 +576,15 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
         if error_response is not None:
             return error_response
+        from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+        try:
+            with run_scope():
+                require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+                return await self._handle_admitted_webhook(request, route_name, route_config, profile, raw_body)
+        except OperatorHoldError as exc:
+            return web.json_response({"status": "held", "code": "operator_hold", "reason": str(exc)}, status=503)
+
+    async def _handle_admitted_webhook(self, request, route_name, route_config, profile, raw_body):
         # Rate limiting (after auth)
         if not self._record_rate_limit_hit(route_name, time.time()):
             return _json_error("Rate limit exceeded", 429)
@@ -612,8 +621,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 prompt = self._apply_skills(prompt, skills)
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
             "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
+        from agent.operator_hold import require_released
+        require_released("webhook admission")
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
-        if not self._record_delivery_id(delivery_id, now):
+        if route_config.get("deliver_only") and not self._record_delivery_id(delivery_id, now):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
             return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         if route_config.get("deliver_only"):
@@ -624,6 +635,10 @@ class WebhookAdapter(BasePlatformAdapter):
     def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> "web.Response":
         """Record delivery info, spawn the agent run, and return 202 immediately."""
+        from agent.operator_hold import require_released
+        require_released("webhook dispatch")
+        if not self._record_delivery_id(delivery_id, now):
+            return web.json_response({"status": "duplicate", "delivery_id": delivery_id}, status=200)
         # An optional chat key groups a sequence (for example one VoIP call)
         # into one resumable conversation; the delivery id remains the default.
         chat_key = request.headers.get("X-Webhook-Chat") or delivery_id
@@ -649,14 +664,6 @@ class WebhookAdapter(BasePlatformAdapter):
                              message_id=delivery_id)
         logger.info("[webhook] %s event=%s route=%s prompt_len=%d delivery=%s", request.method, event_type, route_name,
                     len(prompt), delivery_id)
-        # Operator stop: acknowledge with 503 instead of accepting a delivery that
-        # must not run. Nothing is queued, so nothing can replay after release.
-        from agent.operator_hold import hold_message, is_held
-
-        if is_held():
-            logger.warning("[webhook] rejected delivery=%s: %s", delivery_id, hold_message())
-            return web.json_response({"status": "held", "reason": hold_message(),
-                                      "route": route_name, "delivery_id": delivery_id}, status=503)
         # The per-delivery session is closed by ``on_processing_complete`` once the run finishes
         # (``handle_message`` is fire-and-forget, so nothing can be closed here).
         task = asyncio.create_task(self.handle_message(event))

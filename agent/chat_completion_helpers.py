@@ -662,11 +662,12 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     method = client.converse_stream if stream else client.converse
     finish = (lambda raw: raw.get("stream", [])) if stream else normalize_converse_response
     try:
-        raw_response = method(**api_kwargs)
+        from agent.operator_hold import guarded_call
+        raw_response = guarded_call(method, **api_kwargs)
     except Exception as exc:
         retry_kwargs = recover_from_cache_point_rejection(exc, api_kwargs)
         if retry_kwargs is not None:
-            return finish(method(**retry_kwargs))
+            return finish(guarded_call(method, **retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
             return on_stream_denied(client, api_kwargs, exc)
         if is_stale_connection_error(exc):
@@ -683,6 +684,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    from agent.operator_hold import require_released
+    require_released("provider dispatch")
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -1998,8 +2001,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
 
 def _managed_summary_call(agent, api_request_id: str, request, callback, *, retry_count: int):
     from agent import relay_llm
+    from agent.operator_hold import guarded_call
     return relay_llm.execute_current(
-        request, callback,
+        request, lambda args: guarded_call(callback, args),
         name=str(getattr(agent, "provider", "") or "provider"), model_name=str(getattr(agent, "model", "") or ""),
         metadata={"api_mode": str(getattr(agent, "api_mode", "") or "chat_completions"),
             "api_request_id": api_request_id, "call_role": "iteration_summary", "retry_count": retry_count},
@@ -2335,7 +2339,8 @@ class _BedrockStream:
             "   Grant that action to restore streaming output.\n")
         logger.info("bedrock: converse_stream denied by IAM (%s) — "
             "using non-streaming converse() for this session.", type(exc).__name__)
-        return normalize_converse_response(client.converse(**final_kwargs))
+        from agent.operator_hold import guarded_call
+        return normalize_converse_response(guarded_call(client.converse, **final_kwargs))
 
     def _worker(self):
         agent = self.agent
@@ -2699,7 +2704,8 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
         self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
-        return request_client.chat.completions.create(**stream_kwargs)
+        from agent.operator_hold import guarded_call
+        return guarded_call(request_client.chat.completions.create, **stream_kwargs)
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)

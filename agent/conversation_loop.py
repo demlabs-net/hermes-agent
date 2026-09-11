@@ -1370,6 +1370,8 @@ def _run_phase(fn, agent, state: _LoopState, **extra):
 
     ``extra`` supplies non-state arguments (the caught exception). Returns the verdict so
     the caller can act on ``.action`` / ``.result``."""
+    from agent.operator_hold import require_released
+    require_released("conversation phase")
     params = _PHASE_PARAMS.get(fn)
     if params is None:
         params = _PHASE_PARAMS[fn] = tuple(p for p in inspect.signature(fn).parameters if p != "agent")
@@ -1501,6 +1503,12 @@ def _run_conversation_turn(
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":
+        # This autonomous subprocess owns its own tools; it cannot honor our
+        # per-dispatch grant. Never claim revocation guarantees for that runtime.
+        from agent.operator_hold import configured_policy
+        if configured_policy():
+            from agent.operator_hold import OperatorHoldError
+            raise OperatorHoldError("[operator_hold] codex_app_server lacks revocable dispatch barriers")
         return agent._run_codex_app_server_turn(
             user_message=s.user_message, original_user_message=s.original_user_message,
             messages=s.messages, effective_task_id=s.effective_task_id,
@@ -1587,29 +1595,25 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
-    from agent.operator_hold import require_released
+    from agent.operator_hold import run_scope
     from agent.turn_context import export_current_turn_boundary
 
-    # Single chokepoint for every envelope: cron fires, API-server runs and
-    # platform webhooks all reach this function, so one guard stops them all
-    # without stopping the container itself.
-    require_released("conversation turn")
-
-    result = _run_conversation_turn(
-        agent,
-        user_message,
-        system_message=system_message,
-        conversation_history=conversation_history,
-        task_id=task_id,
-        stream_callback=stream_callback,
-        persist_user_message=persist_user_message,
-        persist_user_timestamp=persist_user_timestamp,
-        persist_user_display_kind=persist_user_display_kind,
-        persist_user_display_metadata=persist_user_display_metadata,
-        persist_user_platform_id=persist_user_platform_id,
-        moa_config=moa_config,
-    )
-    return export_current_turn_boundary(agent, result, user_message)
+    with run_scope():
+        result = _run_conversation_turn(
+            agent,
+            user_message,
+            system_message=system_message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            persist_user_message=persist_user_message,
+            persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
+            persist_user_platform_id=persist_user_platform_id,
+            moa_config=moa_config,
+        )
+        return export_current_turn_boundary(agent, result, user_message)
 
 
 __all__ = ["run_conversation"]

@@ -682,7 +682,8 @@ def _dispatch_authorized_once(
         agent._iters_since_skill = 0
 
     _advance_start_order(lambda: _begin_tool_execution(agent, ref, display_index))
-    return _run_with_activity_heartbeat(agent, ref.name, lambda: execute(ref.args))
+    from agent.operator_hold import guarded_call
+    return _run_with_activity_heartbeat(agent, ref.name, lambda: guarded_call(execute, ref.args))
 
 
 def _run_agent_tool_execution_middleware(

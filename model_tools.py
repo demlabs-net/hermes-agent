@@ -784,7 +784,8 @@ def _execute_tool(function_name: str, function_args: Dict[str, Any], original_ar
         dispatch_kwargs["user_task"] = user_task
 
     def _dispatch(next_args: Dict[str, Any]) -> Any:
-        return registry.dispatch(function_name, next_args, **dispatch_kwargs)
+        from agent.operator_hold import guarded_call
+        return guarded_call(registry.dispatch, function_name, next_args, **dispatch_kwargs)
 
     with _approval_observability(ids):
         if skip_tool_execution_middleware:

@@ -2208,6 +2208,10 @@ class _FireAudit:
 
 
 
+from agent.operator_hold import scoped_run
+
+
+@scoped_run
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
