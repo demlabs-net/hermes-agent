@@ -817,9 +817,14 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
+                async def admitted_handler():
+                    from agent.operator_hold import require_released
+                    require_released("async tool handler")
+                    return await entry.handler(args, **kwargs)
+                result = _run_async(admitted_handler())
             else:
-                result = entry.handler(args, **kwargs)
+                from agent.operator_hold import guarded_call
+                result = guarded_call(entry.handler, args, **kwargs)
             return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.

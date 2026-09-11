@@ -518,6 +518,15 @@ class WebhookAdapter(BasePlatformAdapter):
             raw_body, error_response = await self._read_authenticated_body(request, route_name, route_config)
         if error_response is not None:
             return error_response
+        from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+        try:
+            with run_scope():
+                require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+                return await self._handle_admitted_webhook(request, route_name, route_config, profile, raw_body)
+        except OperatorHoldError as exc:
+            return web.json_response({"status": "held", "code": "operator_hold", "reason": str(exc)}, status=503)
+
+    async def _handle_admitted_webhook(self, request, route_name, route_config, profile, raw_body):
         # Rate limiting (after auth)
         if not self._record_rate_limit_hit(route_name, time.time()):
             return _json_error("Rate limit exceeded", 429)
@@ -554,6 +563,8 @@ class WebhookAdapter(BasePlatformAdapter):
                 prompt = self._apply_skills(prompt, skills)
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
             "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
+        from agent.operator_hold import require_released
+        require_released("webhook admission")
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
         if not self._record_delivery_id(delivery_id, now):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)
@@ -567,6 +578,10 @@ class WebhookAdapter(BasePlatformAdapter):
     def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
                             event_type: str, delivery_id: str, now: float) -> "web.Response":
         """Record delivery info, spawn the agent run, and return 202 immediately."""
+        # Recheck at the dispatch seam: the delivery may have been queued behind
+        # other work, and the operator can rotate the generation in between.
+        from agent.operator_hold import require_released
+        require_released("webhook dispatch")
         # delivery_id in the session key → concurrent webhooks on one route get independent runs.
         session_chat_id = f"webhook:{route_name}:{delivery_id}"
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through

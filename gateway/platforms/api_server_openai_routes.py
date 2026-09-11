@@ -408,6 +408,15 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
+        from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+        try:
+            with run_scope():
+                require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+                return await self._handle_chat_completions_admitted(request)
+        except OperatorHoldError as exc:
+            return web.json_response({"error": {"message": str(exc), "type": "server_error", "code": "operator_hold"}}, status=503)
+
+    async def _handle_chat_completions_admitted(self, request):
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _chat_usage_payload, _coerce_request_bool,
             _content_has_visible_payload, _derive_chat_session_id, _error_response, _invalid_request,
@@ -750,6 +759,15 @@ class OpenAICompatRoutesMixin:
 
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
+        from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+        try:
+            with run_scope():
+                require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+                return await self._handle_responses_admitted(request)
+        except OperatorHoldError as exc:
+            return web.json_response({"error": {"message": str(exc), "type": "server_error", "code": "operator_hold"}}, status=503)
+
+    async def _handle_responses_admitted(self, request):
         from gateway.platforms.api_server import (
             ThreadSafeAsyncQueue, _auto_truncate_response_history, _coerce_request_bool,
             _content_has_visible_payload, _error_response, _invalid_request,
