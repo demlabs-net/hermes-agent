@@ -376,6 +376,16 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
+    from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+    try:
+        with run_scope():
+            require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+            return await _handle_admitted_runs(self, request, _api_server=_api_server)
+    except OperatorHoldError as exc:
+        return _json_error(_api_server._openai_error, str(exc), code="operator_hold", status=503)
+
+
+async def _handle_admitted_runs(self, request, *, _api_server):
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -468,6 +478,8 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
+    from agent.operator_hold import require_released
+    require_released("API run reservation")
     q = self._run_streams[run_id] = asyncio.Queue()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
@@ -624,8 +636,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
+        from tools.thread_context import propagate_context_to_thread
         result, usage = await loop.run_in_executor(
-            None, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+            None, propagate_context_to_thread(
+                lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server)))
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:

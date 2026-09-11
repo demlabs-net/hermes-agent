@@ -2472,9 +2472,12 @@ def _relay_sync_completion(
     from agent.auxiliary_wire import prepare_chat_messages
 
     kwargs = prepare_chat_messages(client, kwargs)
+    from agent.operator_hold import guarded_call
+
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
-    callback = create or (lambda request: _create_with_progress(client, request))
+    provider_callback = create or (lambda request: _create_with_progress(client, request))
+    callback = lambda request: guarded_call(provider_callback, request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     # Isolate only the provider callback so the owning thread can unwind its lease/DB
     # transaction on hard cancel without touching the shared client.
@@ -2496,8 +2499,12 @@ async def _relay_async_completion(
     from agent.auxiliary_wire import prepare_chat_messages
 
     kwargs = prepare_chat_messages(client, kwargs)
+    from agent.operator_hold import guarded_call
+
     # Async twin of the seam default above (#98466).
-    callback = create or (lambda request: _acreate_with_progress(client, request))
+    provider_callback = create or (lambda request: _acreate_with_progress(client, request))
+    async def callback(request):
+        return await guarded_call(provider_callback, request)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
     if route is None:
         return await callback(kwargs)
@@ -2516,12 +2523,13 @@ def _relay_sync_stream(
 
     kwargs = prepare_chat_messages(client, kwargs)
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    from agent.operator_hold import guarded_call
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return guarded_call(client.chat.completions.create, **kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
     return relay_llm.stream_current(
-        kwargs, lambda request: client.chat.completions.create(**request), name=provider_name,
+        kwargs, lambda request: guarded_call(client.chat.completions.create, **request), name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model), finalizer=dict, metadata=metadata,
         completed_response_predicate=lambda value: hasattr(value, "choices"),
     )

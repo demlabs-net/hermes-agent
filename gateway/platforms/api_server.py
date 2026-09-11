@@ -3657,6 +3657,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
 
         def _run():
+            from agent.operator_hold import require_released
+            require_released("queued OpenAI API worker")
             from gateway.session_context import clear_session_vars
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -3732,7 +3734,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            from tools.thread_context import propagate_context_to_thread
+            return await loop.run_in_executor(None, propagate_context_to_thread(_run))
         finally:
             self._inflight_agent_runs -= 1
 
