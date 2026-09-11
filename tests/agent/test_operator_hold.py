@@ -324,6 +324,55 @@ def test_operator_cli_rotates_durable_control(tmp_path):
     assert released["authorized_cron_jobs"] == {}
 
 
+def test_operator_cli_authorizes_one_exact_cron_job(tmp_path):
+    """The CLI must bind ONE exact job id to its payload digest without rewriting
+    the payload, and leave every other job unauthorized."""
+    import json, subprocess, sys
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
+    directory = tmp_path / "hold"
+    home = tmp_path / "home"
+    (home / "cron").mkdir(parents=True)
+    job = {"id": "digest-job", "prompt": "approved payload", "schedule": {"expr": "0 9 * * *"}}
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job]}))
+
+    subprocess.run([sys.executable, str(script), str(directory), "authorize-cron",
+                    "--job-id", "digest-job", "--hermes-home", str(home)],
+                   check=True, capture_output=True)
+
+    control = json.loads((directory / "control.json").read_text())
+    stored = json.loads((home / "cron" / "jobs.json").read_text())["jobs"][0]
+    assert control["authorized_cron_jobs"] == {"digest-job": operator_hold.cron_payload_digest(stored)}
+    assert stored["operator_generation"] == control["generation"]
+    assert stored["prompt"] == "approved payload"
+
+
+def test_operator_cli_refuses_unknown_job_and_payload_edit(tmp_path):
+    """An unknown id is refused without recording anything, and editing the payload
+    afterwards invalidates the recorded digest."""
+    import json, subprocess, sys
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
+    directory = tmp_path / "hold"
+    home = tmp_path / "home"
+    (home / "cron").mkdir(parents=True)
+    job = {"id": "digest-job", "prompt": "approved payload"}
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job]}))
+
+    unknown = subprocess.run([sys.executable, str(script), str(directory), "authorize-cron",
+                              "--job-id", "not-a-job", "--hermes-home", str(home)],
+                             capture_output=True)
+    assert unknown.returncode != 0
+    assert "authorized_cron_jobs" not in json.loads((directory / "control.json").read_text())
+
+    subprocess.run([sys.executable, str(script), str(directory), "authorize-cron",
+                    "--job-id", "digest-job", "--hermes-home", str(home)],
+                   check=True, capture_output=True)
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "digest-job", "prompt": "edited payload"}]}))
+    edited = json.loads((home / "cron" / "jobs.json").read_text())["jobs"][0]
+    with operator_hold.run_scope():
+        with pytest.raises(operator_hold.OperatorHoldError):
+            operator_hold.require_cron_authorization(edited)
+
+
 def test_provider_dispatch_does_not_invoke_client_after_rotation(tmp_path):
     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
     from types import SimpleNamespace

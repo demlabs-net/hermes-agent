@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Operator-host-only control writer. Never mount this directory writable in agents.
 
-Usage: python3 scripts/operator_hold.py /host/operator-hold hold|release
-Provision control.json before starting a configured agent. Directory mount into
-containers must be read-only (mount the directory, not an individual inode).
-Release also removes the legacy active marker; an environment hold still wins.
+Usage:
+  python3 scripts/operator_hold.py /host/operator-hold hold
+  python3 scripts/operator_hold.py /host/operator-hold release
+  python3 scripts/operator_hold.py /host/operator-hold authorize-cron \
+      --job-id <exact id> --hermes-home /host/hermes-home
+
+Provision control.json before starting a configured agent (init is implicit: the
+first hold/release writes the file). Directory mount into containers must be
+read-only (mount the directory, not an individual inode). Every hold/release
+rotates the generation; release also clears the cron authorizations and removes
+the legacy active marker. An environment hold still wins.
 """
 import argparse
 import json
