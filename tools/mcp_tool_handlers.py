@@ -93,6 +93,15 @@ def _acquire_call_server(server_name: str, tool_timeout: float):
     return None, not_connected
 
 
+# Marker Hermes stamps on a rendered payload when the SERVER itself answered with ``isError``.
+# The RPC round-trip completed, so a business-level answer (not found, permission denied,
+# validation, quota) is evidence of a HEALTHY transport and must never open the
+# server-unreachable breaker — only real transport failures (timeout, connection error, dead
+# session/stdio) may. Without this, three consecutive "document not found" answers marked a
+# perfectly healthy server unreachable and blocked every call to it for the whole cooldown.
+_MCP_APPLICATION_ERROR_KEY = "_mcp_application_error"
+
+
 def _result_is_error(result) -> bool:
     """True only for a JSON payload carrying an ``error`` key (non-JSON = success)."""
     try:
@@ -101,9 +110,25 @@ def _result_is_error(result) -> bool:
         return False
 
 
+def _result_is_transport_failure(result) -> bool:
+    """True only for an error payload that is NOT an application-level tool answer.
+
+    The breaker measures TRANSPORT health. A valid ``CallToolResult`` with ``isError`` proves the
+    round-trip worked, so it must be recorded as a success; only Hermes' own unmarked
+    transport-failure payloads strike the breaker."""
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(parsed, dict) or "error" not in parsed:
+        return False
+    return parsed.get(_MCP_APPLICATION_ERROR_KEY) is not True
+
+
 def _record_call_outcome(server_name: str, result) -> Any:
-    """Breaker bookkeeping: an error payload from the tool itself still counts as a strike."""
-    (_core._bump_server_error if _result_is_error(result) else _core._reset_server_error)(server_name)
+    """Breaker bookkeeping for a completed RPC round-trip. An application-level error answer
+    still reached the server, so it closes the breaker instead of striking it."""
+    (_core._bump_server_error if _result_is_transport_failure(result) else _core._reset_server_error)(server_name)
     return result
 
 
@@ -127,14 +152,17 @@ def _lookup_reconnectable_server(server_name: str, require_loop: bool = False):
 
 
 def _retry_once(server_name: str, retry_call, op_description: str, what: str):
-    """Re-run ``retry_call`` after a recovery step. Returns the result (closing the breaker)
-    when it is not an error payload; None when the retry raised or errored (caller falls through)."""
+    """Re-run ``retry_call`` after a recovery step. Returns the result (closing the breaker) for any
+    completed round-trip — an application-level error answer included, since the server clearly
+    answered and the model must see its real business error instead of a bogus re-auth/unreachable
+    message. None only when the retry raised or produced a transport failure (caller falls through
+    to the recovery-specific strike)."""
     try:
         result = retry_call()
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after %s failed: %s", server_name, op_description, what, retry_exc)
         return None
-    if _result_is_error(result):
+    if _result_is_transport_failure(result):
         return None
     _core._reset_server_error(server_name)
     return result
@@ -435,7 +463,12 @@ def _render_call_tool_result(result, server_name: str) -> str:
     fills in only when the blocks rendered effectively empty, keeping structuredContent-only
     servers working. ``_meta`` minus reserved keys is always surfaced."""
     if mcp_field(result, "is_error", "isError", False):
-        return tool_error(_sanitize_error(_truncate_mcp_text_result(_error_result_text(result) or "MCP tool returned an error")))
+        # The server ANSWERED (this is a CallToolResult, not a transport failure): tag the payload
+        # so the breaker bookkeeping in ``_record_call_outcome`` cannot mistake an application
+        # error for server unreachability.
+        return tool_error(
+            _sanitize_error(_truncate_mcp_text_result(_error_result_text(result) or "MCP tool returned an error")),
+            **{_MCP_APPLICATION_ERROR_KEY: True})
     text_result, usable_parts = _render_content_blocks(result, server_name)
     structured = _capped_structured_content(result)
     meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))

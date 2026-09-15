@@ -572,3 +572,164 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+# ---------------------------------------------------------------------------
+# Application-level tool errors must NOT trip the breaker
+#
+# Incident 15.09.2026 (sales roy1): the contactor reconstructed an SLC task_id from the Russian
+# task NAME, producing Cyrillic/Latin homoglyphs. slc-mcp was healthy the whole time and
+# correctly answered ``isError: true`` / "document not found" — but three consecutive such
+# answers opened the breaker, after which EVERY slc tool was blocked for the cooldown,
+# including the quarantine write the run needed. An application-level answer is a completed
+# transport round-trip and is not evidence of an unreachable server.
+# ---------------------------------------------------------------------------
+
+
+def test_application_error_does_not_open_breaker(monkeypatch, tmp_path):
+    """Repeated ``isError`` answers from a healthy server must never mark it unreachable."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_not_found(*a, **kw):
+        call_count["n"] += 1
+        result = MagicMock()
+        result.is_error = True
+        block = MagicMock()
+        block.text = "Не найдено (get_task): document not found: demlabs_190_konveyер_partii_5"
+        result.content = [block]
+        result.structured_content = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_not_found)
+    _mcp_loop._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "get_task", 10.0)
+        attempts = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 2
+        for i in range(attempts):
+            parsed = json.loads(handler({}))
+            # The model still sees the business error — it must act on it, not be told the
+            # server is down.
+            assert "document not found" in parsed["error"], parsed
+            assert "unreachable" not in parsed["error"].lower(), (
+                f"call {i + 1} was short-circuited as server-unreachable: {parsed}")
+        assert call_count["n"] == attempts, (
+            "every application error must still reach the session; "
+            f"only {call_count['n']}/{attempts} did")
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+            "application errors must not accumulate breaker strikes, got "
+            f"{mcp_tool._server_error_counts.get('srv')}")
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_application_error_clears_accumulated_transport_strikes(monkeypatch, tmp_path):
+    """A successful round-trip that carries a business error still closes the breaker."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    async def _call_tool_not_found(*a, **kw):
+        result = MagicMock()
+        result.is_error = True
+        block = MagicMock()
+        block.text = "not found"
+        result.content = [block]
+        result.structured_content = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_not_found)
+    _mcp_loop._ensure_mcp_loop()
+
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+        handler = _make_tool_handler("srv", "get_task", 10.0)
+        parsed = json.loads(handler({}))
+        assert parsed.get("_mcp_application_error") is True, parsed
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+            "a completed round-trip must clear prior strikes even when the answer is an error")
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_transport_failure_still_opens_breaker(monkeypatch, tmp_path):
+    """Real transport failures (raised, not answered) must still trip the breaker."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _make_tool_handler
+
+    async def _call_tool_fails(*a, **kw):
+        raise RuntimeError("connection reset by peer")
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_fails)
+    _mcp_loop._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "get_task", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+            parsed = json.loads(handler({}))
+            assert "error" in parsed, parsed
+        # Threshold reached: the next call short-circuits without touching the session.
+        parsed = json.loads(handler({}))
+        assert "unreachable" in parsed["error"].lower(), parsed
+        assert mcp_tool._server_error_counts["srv"] >= mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ('{"error": "document not found: x"}', True),
+    ('{"error": "boom", "_mcp_application_error": true}', False),
+    ('{"error": "boom", "_mcp_application_error": false}', True),
+    ('{"result": "ok"}', False),
+    ("not json", False),
+    ("[]", False),
+    ('{"error": "x", "_mcp_application_error": "yes"}', True),  # non-bool is not a marker
+])
+def test_result_is_transport_failure_classification(payload, expected):
+    from tools.mcp_tool_handlers import _result_is_transport_failure
+
+    assert _result_is_transport_failure(payload) is expected
+
+
+def test_retry_once_returns_application_error_and_closes_breaker():
+    """A recovery retry that completes a round-trip with an ``isError`` answer is a breaker
+    SUCCESS: the model must see the real business error, not a bogus needs_reauth/unreachable
+    message, and a prior strike count must clear."""
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _retry_once
+
+    name = "srv"
+    mcp_tool._server_error_counts[name] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+    try:
+        app_error = json.dumps(
+            {"error": "Не найдено (get_task): document not found: x", "_mcp_application_error": True},
+            ensure_ascii=False)
+        result = _retry_once(name, lambda: app_error, "tools/call get_task", "auth recovery")
+        assert result == app_error, "an answered application error must be returned to the model"
+        assert mcp_tool._server_error_counts.get(name, 0) == 0, (
+            "a completed round-trip must clear strikes even on the recovery retry path")
+    finally:
+        _cleanup(mcp_tool, name)
+
+
+def test_retry_once_returns_none_for_transport_failure():
+    """An unmarked Hermes transport-failure payload still falls through to the recovery strike."""
+    from tools import mcp_tool
+    from tools.mcp_tool_handlers import _retry_once
+
+    name = "srv"
+    mcp_tool._server_error_counts[name] = 1
+    try:
+        transport_error = json.dumps({"error": "MCP call failed: ConnectError"})
+        assert _retry_once(name, lambda: transport_error, "tools/call x", "session reconnect") is None
+        assert mcp_tool._server_error_counts.get(name, 0) == 1, "a transport failure must not clear the count"
+    finally:
+        _cleanup(mcp_tool, name)
