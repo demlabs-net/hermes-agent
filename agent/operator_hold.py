@@ -168,10 +168,22 @@ def cron_payload_digest(job):
     if any(job.get(k) for k in ("script", "monitor_script", "monitor_url", "skills", "skill", "context_from")):
         raise ValueError("configured cron requires a self-contained prompt (no scripts/skills/context imports)")
     # Bind every non-runtime field, including future tool/provider permissions.
+    # The engine also mutates its own bookkeeping between approval and the next fire: the
+    # due scan persists last_dispatch, the claim adds _scheduled_instant, a run bumps the
+    # repeat/failure counters. Binding those made every approved job unauthorized on its
+    # first fire, so they belong to the runtime set, not to the payload.
     runtime = {"operator_generation", "next_run_at", "last_run_at", "last_status", "last_error",
                "run_count", "state", "enabled", "paused_at", "paused_reason", "updated_at",
-               "run_claim", "fire_claim", "last_output", "last_response"}
-    payload = json.dumps({k: v for k, v in job.items() if k not in runtime}, sort_keys=True, separators=(",", ":"))
+               "run_claim", "fire_claim", "last_output", "last_response",
+               "_scheduled_instant", "execution_id", "latest_execution", "last_dispatch",
+               "last_delivery_queued", "last_delivery_error", "last_fire_error",
+               "failure_streak", "preflight_alerted", "manual_run_at", "manual_run_prompt"}
+    payload = {k: v for k, v in job.items() if k not in runtime}
+    # ``repeat`` mixes the operator-approved run limit with a run counter: keep ``times``
+    # bound, drop ``completed`` — otherwise each finished run revoke its own approval.
+    if isinstance(payload.get("repeat"), dict):
+        payload["repeat"] = {"times": payload["repeat"].get("times")}
+    payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

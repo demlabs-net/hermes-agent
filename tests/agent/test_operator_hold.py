@@ -308,6 +308,41 @@ def test_ro_cron_authorization_binds_payload_and_rejects_scripts(tmp_path):
             operator_hold.require_cron_authorization({**job, "script": "/tmp/mutable.sh"})
 
 
+def test_cron_authorization_survives_engine_bookkeeping(tmp_path):
+    """An approval must survive the engine's own bookkeeping.
+
+    The fire path hands run_job a claimed copy carrying ``_scheduled_instant``; the due scan
+    persists ``last_dispatch``; a run bumps ``repeat``/``failure_streak``. All of that changes
+    outside the payload, so binding it denied every approved job on its first real fire
+    (observed live: nine jobs rejected with "job payload not operator authorized" immediately
+    after the operator authorized them).
+    """
+    import json
+    job = {"id": "one", "prompt": "approved", "operator_generation": "initial",
+           "repeat": {"times": None, "completed": 3}}
+    control = tmp_path / "hold" / "control.json"
+    data = json.loads(control.read_text())
+    data["authorized_cron_jobs"] = {"one": operator_hold.cron_payload_digest(job)}
+    control.write_text(json.dumps(data))
+
+    with operator_hold.run_scope():
+        operator_hold.require_cron_authorization(job)
+        for bookkeeping in (
+            {"_scheduled_instant": "2026-09-15T04:00:00+00:00"},
+            {"last_dispatch": {"kind": "scheduled", "dispatched_at": "2026-09-15T04:00:00+00:00"}},
+            {"repeat": {"times": None, "completed": 4}},
+            {"failure_streak": 1, "last_error": "boom", "last_delivery_error": None},
+            {"execution_id": "exec-1", "latest_execution": "exec-1", "fire_claim": {"by": "ticker"}},
+            {"manual_run_at": "2026-09-15T04:00:00+00:00", "manual_run_prompt": None},
+        ):
+            operator_hold.require_cron_authorization({**job, **bookkeeping})
+        # The payload itself stays bound: an edited prompt, or an edited run limit
+        # (``repeat.times``), is still refused.
+        for edited in ({"prompt": "edited"}, {"repeat": {"times": 5, "completed": 4}}):
+            with pytest.raises(operator_hold.OperatorHoldError):
+                operator_hold.require_cron_authorization({**job, **edited})
+
+
 def test_operator_cli_rotates_durable_control(tmp_path):
     import json, subprocess, sys
     script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
