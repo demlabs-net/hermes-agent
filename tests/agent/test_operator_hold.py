@@ -343,6 +343,59 @@ def test_cron_authorization_survives_engine_bookkeeping(tmp_path):
                 operator_hold.require_cron_authorization({**job, **edited})
 
 
+def test_cron_authorization_covers_only_the_approved_extra_prompt(tmp_path):
+    """One approved per-fire text, for one job: nothing wider becomes admissible."""
+    import json
+    job = {"id": "one", "prompt": "approved", "operator_generation": "initial"}
+    other = {"id": "two", "prompt": "approved", "operator_generation": "initial"}
+    approved = "one sequential batch of at most 20 existing cards; no calls"
+    control = tmp_path / "hold" / "control.json"
+    data = json.loads(control.read_text())
+    data["authorized_cron_jobs"] = {
+        j["id"]: operator_hold.cron_payload_digest(j) for j in (job, other)}
+    data["authorized_cron_extras"] = {"one": [operator_hold.extra_prompt_digest(approved)]}
+    control.write_text(json.dumps(data))
+
+    with operator_hold.run_scope():
+        operator_hold.require_cron_authorization(job)  # a plain fire still needs no extra
+        operator_hold.require_cron_authorization(job, approved)
+        for refused in (approved + " and also delete the CRM", "something else", ""):
+            if not refused:
+                continue
+            with pytest.raises(operator_hold.OperatorHoldError) as err:
+                operator_hold.require_cron_authorization(job, refused)
+            assert "extra_prompt" in str(err.value)
+        # The approval is bound to the job that was approved, not to the text.
+        with pytest.raises(operator_hold.OperatorHoldError):
+            operator_hold.require_cron_authorization(other, approved)
+
+
+def test_run_job_admits_operator_approved_extra_prompt(monkeypatch, tmp_path):
+    """An approved text reaches the job; an unapproved one never reaches the helper."""
+    import json
+    from cron import scheduler
+    job = {"id": "one", "prompt": "approved", "operator_generation": "initial"}
+    approved = "run one sequential batch"
+    control = tmp_path / "hold" / "control.json"
+    data = json.loads(control.read_text())
+    data["authorized_cron_jobs"] = {"one": operator_hold.cron_payload_digest(job)}
+    data["authorized_cron_extras"] = {"one": [operator_hold.extra_prompt_digest(approved)]}
+    control.write_text(json.dumps(data))
+
+    seen = []
+
+    def fake_prepare(job_arg, job_id, job_name, extra_prompt, cancel_event=None):
+        seen.append(extra_prompt)
+        return ((True, "doc", "resp", None), "prompt")
+
+    monkeypatch.setattr(scheduler, "_prepare_job_prompt", fake_prepare)
+    assert scheduler.run_job(job, extra_prompt=approved) == (True, "doc", "resp", None)
+    assert seen == [approved]
+    refused = scheduler.run_job(job, extra_prompt="unapproved external task")
+    assert refused[0] is False and "extra_prompt" in refused[3]
+    assert seen == [approved]
+
+
 def test_operator_cli_rotates_durable_control(tmp_path):
     import json, subprocess, sys
     script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
@@ -406,6 +459,44 @@ def test_operator_cli_refuses_unknown_job_and_payload_edit(tmp_path):
     with operator_hold.run_scope():
         with pytest.raises(operator_hold.OperatorHoldError):
             operator_hold.require_cron_authorization(edited)
+
+
+def test_operator_cli_authorizes_one_exact_extra_prompt(tmp_path):
+    """authorize-extra records one exact text for one job, and the barrier then admits it."""
+    import json, subprocess, sys
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
+    directory = tmp_path / "hold"
+    home = tmp_path / "home"
+    (home / "cron").mkdir(parents=True)
+    (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "prompt": "approved payload"}]}))
+    subprocess.run([sys.executable, str(script), str(directory), "authorize-cron",
+                    "--job-id", "j1", "--hermes-home", str(home)], check=True, capture_output=True)
+
+    text = "one sequential batch of at most 20 existing cards; public sources only"
+    extra = tmp_path / "extra.txt"
+    extra.write_text(text)
+    subprocess.run([sys.executable, str(script), str(directory), "authorize-extra",
+                    "--job-id", "j1", "--extra-prompt-file", str(extra)], check=True, capture_output=True)
+
+    control = json.loads((directory / "control.json").read_text())
+    assert control["authorized_cron_extras"] == {"j1": [operator_hold.extra_prompt_digest(text)]}
+    stored = json.loads((home / "cron" / "jobs.json").read_text())["jobs"][0]
+    with operator_hold.run_scope():
+        operator_hold.require_cron_authorization(stored, text)
+        with pytest.raises(operator_hold.OperatorHoldError):
+            operator_hold.require_cron_authorization(stored, text + "!")
+
+
+def test_operator_cli_extra_prompt_digest_matches_module():
+    """The host utility must run where no Hermes tree exists, so its local digest has to
+    agree with the module's — otherwise an approval would be recorded for another text."""
+    import importlib.util
+    script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "operator_hold.py"
+    spec = importlib.util.spec_from_file_location("operator_hold_cli", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for text in ("plain", "многострочный\nтекст ✓", ""):
+        assert module._extra_prompt_digest(text) == operator_hold.extra_prompt_digest(text)
 
 
 def test_provider_dispatch_does_not_invoke_client_after_rotation(tmp_path):

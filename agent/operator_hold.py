@@ -4,7 +4,10 @@ Sales deployments explicitly set HERMES_OPERATOR_HOLD_FILE to the legacy marker
 on a read-only directory mount. Its sibling control.json MUST contain
 {"generation": "unique opaque token", "held": false}. Operators atomically
 replace that file with a fresh generation on EVERY hold/release, never delete it.
-The marker and environment remain additional stop controls. A successful check
+The same file carries the operator's cron approvals: authorized_cron_jobs (one
+payload digest per job id) and authorized_cron_extras (per job id, the digests of
+the per-fire instruction texts the operator approved). The marker and environment
+remain additional stop controls. A successful check
 is the admission linearization point: already admitted HTTP/tools may finish.
 Unconfigured desktop installations retain optional legacy-marker behavior.
 """
@@ -187,7 +190,18 @@ def cron_payload_digest(job):
     return hashlib.sha256(payload.encode()).hexdigest()
 
 
-def require_cron_authorization(job):
+def extra_prompt_digest(text: str) -> str:
+    """Digest of one exact per-fire instruction block the operator approved.
+
+    Bound separately from the job payload: a job approval must never carry whatever
+    instructions a later trigger happens to attach, and re-approving the same text must
+    stay valid across the single-fire stamps the engine adds and removes.
+    """
+    import hashlib
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+
+
+def require_cron_authorization(job, extra_prompt: str | None = None):
     if not configured_policy():
         return
     require_generation(job.get("operator_generation"))
@@ -196,8 +210,13 @@ def require_cron_authorization(job):
         digest = data.get("authorized_cron_jobs", {}).get(job["id"])
         if digest != cron_payload_digest(job):
             raise ValueError("job payload not operator authorized")
+        approved_extras = (data.get("authorized_cron_extras") or {}).get(job["id"]) or []
     except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
         raise OperatorHoldError(f"{HOLD_MARKER} cron authorization denied: {exc}") from exc
+    # A per-fire extra prompt carries fresh instructions, so an authorized job never covers
+    # it: the operator approves that exact text by digest, host-side, and nothing else does.
+    if extra_prompt and extra_prompt_digest(extra_prompt) not in approved_extras:
+        raise OperatorHoldError(f"{HOLD_MARKER} per-fire extra_prompt is not operator authorized")
     require_released("cron authorization")
 
 
@@ -210,9 +229,9 @@ def scoped_run(callback):
         try:
             with run_scope():
                 job = args[0] if args else kwargs["job"]
-                if configured_policy() and kwargs.get("extra_prompt"):
-                    raise OperatorHoldError(f"{HOLD_MARKER} per-fire extra_prompt is not operator authorized")
-                require_cron_authorization(job)
+                # A per-fire extra_prompt stays admissible, but only with its own approval:
+                # the check below refuses one the operator never approved by digest.
+                require_cron_authorization(job, kwargs.get("extra_prompt"))
                 return callback(*args, **kwargs)
         except OperatorHoldError as exc:
             return False, "", "", str(exc)
