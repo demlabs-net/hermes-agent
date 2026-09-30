@@ -24,6 +24,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _api_request_profile,
     _approval_event_choices,
+    _publish_turn_process_ownership,
     _start_api_run_budget_watchdog,
     cors_middleware,
     security_headers_middleware,
@@ -728,21 +729,28 @@ class TestSteerRun:
                 run_id = (await start_resp.json())["run_id"]
                 assert run_started.wait(timeout=3.0)
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
-                assert stop_resp.status == 200
-                assert run_id in adapter._active_run_agents
+                stop = asyncio.create_task(cli.post(f"/v1/runs/{run_id}/stop"))
+                try:
+                    for _ in range(100):
+                        if adapter._run_statuses[run_id]["status"] == "stopping":
+                            break
+                        await asyncio.sleep(0.01)
+                    assert adapter._run_statuses[run_id]["status"] == "stopping"
+                    assert not stop.done()
+                    assert run_id in adapter._active_run_agents
 
-                steer_resp = await cli.post(
-                    f"/v1/runs/{run_id}/steer",
-                    json={"input": "tighten the ending"},
-                )
-                steer_data = await steer_resp.json()
+                    steer_resp = await cli.post(
+                        f"/v1/runs/{run_id}/steer",
+                        json={"input": "tighten the ending"},
+                    )
+                    steer_data = await steer_resp.json()
 
-                assert steer_resp.status == 409
-                assert steer_data["error"]["code"] == "run_not_accepting_steer"
-                mock_agent.steer.assert_not_called()
-
-                run_can_finish.set()
+                    assert steer_resp.status == 409
+                    assert steer_data["error"]["code"] == "run_not_accepting_steer"
+                    mock_agent.steer.assert_not_called()
+                finally:
+                    run_can_finish.set()
+                assert (await asyncio.wait_for(stop, 5)).status == 200
                 for _ in range(40):
                     if run_id not in adapter._active_run_tasks:
                         break
@@ -948,6 +956,145 @@ class TestRunOwnershipAcrossProfiles:
 class TestStopRun:
 
     @pytest.mark.asyncio
+    async def test_stop_during_agent_construction_never_starts_turn(self, adapter):
+        """Stop in the pre-registration gap must settle and never enter the executor."""
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        stop_responses = []
+
+        def create_agent(**_kwargs):
+            # The synchronous factory runs on the event-loop thread. Issue the
+            # authenticated stop on another thread at the exact pre-register gap.
+            def stop_in_thread():
+                request = MagicMock()
+                request.headers = {}
+                request.match_info = {"run_id": next(iter(adapter._active_run_tasks))}
+                request.path = f"/v1/runs/{request.match_info['run_id']}/stop"
+                stop_responses.append(asyncio.run(adapter._handle_stop_run(request)))
+
+            thread = threading.Thread(target=stop_in_thread)
+            thread.start()
+            thread.join(timeout=3)
+            assert not thread.is_alive()
+            return agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=create_agent):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses[run_id]["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+                assert len(stop_responses) == 1
+                assert stop_responses[0].status == 200
+                assert agent.run_conversation.call_count == 0
+                assert agent.close.call_count == 1
+                assert agent.interrupt.call_count == 0
+                assert run_id not in adapter._active_run_agents
+                assert run_id not in adapter._active_run_tasks
+                status = await cli.get(f"/v1/runs/{run_id}")
+                assert (await status.json())["status"] == "cancelled"
+                again = await cli.post(f"/v1/runs/{run_id}/stop")
+                assert (await again.json())["status"] == "cancelled"
+
+    @pytest.mark.asyncio
+    async def test_stop_before_executor_entry_never_starts_turn(self, adapter):
+        """The executor must honor a stop after the event-loop's final check."""
+        app = _create_runs_app(adapter)
+        agent = MagicMock()
+        agent.run_budget_seconds = 0
+
+        def stop_at_executor_boundary(_agent, _task_id, *, session_key):
+            request = MagicMock()
+            request.headers = {}
+            request.match_info = {"run_id": session_key}
+            request.path = f"/v1/runs/{session_key}/stop"
+            # Preserve real ownership/baseline setup to exercise stop reaping.
+            _publish_turn_process_ownership(_agent, _task_id, session_key=session_key)
+            response = asyncio.run(adapter._handle_stop_run(request))
+            assert response.status == 200
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", return_value=agent),
+                patch("gateway.platforms.api_server._publish_turn_process_ownership",
+                      side_effect=stop_at_executor_boundary),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses[run_id]["status"] == "cancelled":
+                        break
+                    await asyncio.sleep(0.05)
+                status = await cli.get(f"/v1/runs/{run_id}")
+                assert (await status.json())["status"] == "cancelled"
+                agent.run_conversation.assert_not_called()
+                assert run_id not in adapter._active_run_agents
+
+    @pytest.mark.asyncio
+    async def test_stop_at_final_check_before_method_entry_waits_for_turn(self, adapter):
+        """Stop in the check/call gap cannot ACK before any turn hooks execute."""
+        app = _create_runs_app(adapter)
+        checked = threading.Event()
+        allow_entry = threading.Event()
+        turn_finished = threading.Event()
+        agent = MagicMock()
+        agent.run_budget_seconds = 0
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+        call_order = []
+
+        class GatedEntry:
+            def __getattribute__(self, name):
+                if name == "run_conversation":
+                    checked.set()
+                    assert allow_entry.wait(timeout=5)
+                    def run(**_kwargs):
+                        call_order.append("entered")
+                        turn_finished.set()
+                        return {"final_response": "done"}
+                    return run
+                return super().__getattribute__(name)
+
+            def __getattr__(self, name):
+                return getattr(agent, name)
+
+        # Delegate all gateway agent lifecycle methods to the mock, while
+        # suspending method lookup exactly after the final stop check.
+        gated = GatedEntry()
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", return_value=gated):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                try:
+                    assert await asyncio.to_thread(checked.wait, 3)
+                    stop = asyncio.create_task(cli.post(f"/v1/runs/{run_id}/stop"))
+                    for _ in range(100):
+                        if adapter._run_statuses[run_id]["status"] == "stopping":
+                            break
+                        await asyncio.sleep(0.01)
+                    assert adapter._run_statuses[run_id]["status"] == "stopping"
+                    assert not stop.done()
+                    poll = await cli.get(f"/v1/runs/{run_id}")
+                    assert (await poll.json())["status"] == "stopping"
+                finally:
+                    allow_entry.set()
+                stopped = await asyncio.wait_for(stop, 5)
+                assert stopped.status == 200
+                assert turn_finished.is_set()
+                assert call_order == ["entered"]
+                for _ in range(100):
+                    if adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+                assert (await (await cli.get(f"/v1/runs/{run_id}")).json())["status"] == "completed"
+
+    @pytest.mark.asyncio
     async def test_completion_wins_before_uncooperative_stop_is_acknowledged(
         self, adapter
     ):
@@ -977,16 +1124,21 @@ class TestStopRun:
                 run_id = (await resp.json())["run_id"]
                 assert started.wait(timeout=3)
 
-                stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop = asyncio.create_task(cli.post(f"/v1/runs/{run_id}/stop"))
+                try:
+                    for _ in range(100):
+                        if adapter._run_statuses[run_id]["status"] == "stopping":
+                            break
+                        await asyncio.sleep(0.01)
+                    assert not run_finished.is_set()
+                    assert not stop.done()
+                    assert run_id in adapter._active_run_agents
+                    assert run_id in adapter._active_run_tasks
+                    assert adapter._run_statuses[run_id]["status"] == "stopping"
+                finally:
+                    run_can_finish.set()
+                stop_resp = await asyncio.wait_for(stop, 5)
                 assert stop_resp.status == 200
-                await asyncio.sleep(0.1)
-
-                assert not run_finished.is_set()
-                assert run_id in adapter._active_run_agents
-                assert run_id in adapter._active_run_tasks
-                assert adapter._run_statuses[run_id]["status"] == "stopping"
-
-                run_can_finish.set()
                 for _ in range(40):
                     if run_id not in adapter._active_run_tasks:
                         break
@@ -996,6 +1148,101 @@ class TestStopRun:
                 assert run_id not in adapter._active_run_tasks
                 assert adapter._run_statuses[run_id]["status"] == "completed"
                 assert adapter._run_statuses[run_id]["output"] == "late result"
+
+    @pytest.mark.asyncio
+    async def test_uncooperative_turn_stop_times_out_without_retiring_live_run(self, adapter, monkeypatch):
+        from gateway.platforms import api_server_runs
+
+        monkeypatch.setattr(api_server_runs, "_RUN_STOP_ENTRY_WAIT_SECONDS", 0.05)
+        release = threading.Event()
+        entered = threading.Event()
+        agent = MagicMock()
+        agent.run_budget_seconds = 0
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def uncooperative_turn(**_kwargs):
+            entered.set()
+            assert release.wait(timeout=5)
+            return {"final_response": "late result"}
+
+        agent.run_conversation.side_effect = uncooperative_turn
+        try:
+            async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+                with patch.object(adapter, "_create_agent", return_value=agent):
+                    response = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await response.json())["run_id"]
+                    assert await asyncio.to_thread(entered.wait, 3)
+                    stopped = await asyncio.wait_for(cli.post(f"/v1/runs/{run_id}/stop"), 1)
+                    assert (await stopped.json()) == {"run_id": run_id, "status": "stopping"}
+                    assert (await (await cli.get(f"/v1/runs/{run_id}")).json())["status"] == "stopping"
+                    assert run_id in adapter._stopping_run_ids
+                    assert run_id in adapter._active_run_agents
+                    assert run_id in adapter._active_run_tasks
+                    assert agent.close.call_count == 0
+                    release.set()
+                    for _ in range(100):
+                        if run_id not in adapter._active_run_tasks:
+                            break
+                        await asyncio.sleep(0.01)
+                    assert run_id not in adapter._active_run_tasks
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    assert status["status"] == "completed"
+                    assert status["output"] == "late result"
+        finally:
+            release.set()
+
+    @pytest.mark.asyncio
+    async def test_stop_timeout_during_uncertain_entry_does_not_ack_cancelled(self, adapter, monkeypatch):
+        from gateway.platforms import api_server_runs
+
+        monkeypatch.setattr(api_server_runs, "_RUN_STOP_ENTRY_WAIT_SECONDS", 0.05)
+        checked = threading.Event()
+        release = threading.Event()
+        entered = threading.Event()
+        agent = MagicMock()
+        agent.run_budget_seconds = 0
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        class GatedEntry:
+            def __getattribute__(self, name):
+                if name == "run_conversation":
+                    checked.set()
+                    assert release.wait(timeout=5)
+                    def turn(**_kwargs):
+                        entered.set()
+                        return {"final_response": "entered despite stop"}
+                    return turn
+                return super().__getattribute__(name)
+
+            def __getattr__(self, name):
+                return getattr(agent, name)
+
+        try:
+            async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+                with patch.object(adapter, "_create_agent", return_value=GatedEntry()):
+                    response = await cli.post("/v1/runs", json={"input": "hello"})
+                    run_id = (await response.json())["run_id"]
+                    assert await asyncio.to_thread(checked.wait, 3)
+                    stopped = await asyncio.wait_for(cli.post(f"/v1/runs/{run_id}/stop"), 1)
+                    assert (await stopped.json())["status"] == "stopping"
+                    assert not entered.is_set()
+                    assert (await (await cli.get(f"/v1/runs/{run_id}")).json())["status"] == "stopping"
+                    assert run_id in adapter._active_run_tasks
+                    release.set()
+                    assert await asyncio.to_thread(entered.wait, 3)
+                    for _ in range(100):
+                        if run_id not in adapter._active_run_tasks:
+                            break
+                        await asyncio.sleep(0.01)
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    assert status["status"] == "completed"
+                    assert status["output"] == "entered despite stop"
+        finally:
+            release.set()
 
     @pytest.mark.asyncio
     async def test_stop_running_agent(self, adapter):

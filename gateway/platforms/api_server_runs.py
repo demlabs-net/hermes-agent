@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -43,6 +44,9 @@ _FIXED_EVENT_FIELDS = {
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
+# How long /stop waits for a turn that already crossed the entry lock to exit.
+# Past it the response stays "stopping"; the run is not reported cancelled.
+_RUN_STOP_ENTRY_WAIT_SECONDS = 1.0
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -90,6 +94,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_idempotency_ids: set[str] = set()
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
+    # Per-run lock held across the executor's final stop check and its turn entry,
+    # so /stop can never acknowledge a turn that is about to start.
+    self._run_entry_locks: dict[str, threading.Lock] = {}
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
@@ -349,7 +356,7 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids)
+                self._stopping_run_ids, self._run_entry_locks)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -502,6 +509,7 @@ async def _handle_admitted_runs(self, request, *, _api_server):
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
     self._activate_admitted_request()
+    self._run_entry_locks[run_id] = threading.Lock()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
@@ -553,14 +561,27 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
             register_gateway_notify(run.approval_session_key, approval_notify)
+            # The executor may start after /stop has acknowledged, including a stop
+            # between agent construction and its registration. Never enter a new turn
+            # once that cancellation has been observed.
+            if run.run_id in self._stopping_run_ids:
+                return {"interrupted": True}, {}
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
             _api_server._publish_turn_process_ownership(
                 agent, effective_task_id, session_key=run.approval_session_key,
             )
-            r = agent.run_conversation(
-                user_message=run.user_message, conversation_history=run.conversation_history,
-                task_id=effective_task_id)
+            # The stop flag and the method invocation share one admission boundary:
+            # holding this per-run lock across the call means a stop that arrives after
+            # the check cannot be acknowledged while a not-yet-entered turn might still
+            # run hooks. The stop path interrupts first, then waits for this lock in a
+            # worker thread (never on the event loop).
+            with self._run_entry_locks[run.run_id]:
+                if run.run_id in self._stopping_run_ids:
+                    return {"interrupted": True}, {}
+                r = agent.run_conversation(
+                    user_message=run.user_message, conversation_history=run.conversation_history,
+                    task_id=effective_task_id)
         finally:
             if self._reap_background_processes_on_run_completion:
                 _api_server._reap_disconnected_agent_processes(
@@ -635,6 +656,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
+        # /stop may have run during synchronous _create_agent, before there was an
+        # agent to interrupt. No await occurs between this check and dispatch; the
+        # executor also checks the stopping flag at its own entry boundary.
+        if run_id in self._stopping_run_ids:
+            _finish("cancelled")
+            return
         run_budget_watchdog = _api_server._start_api_run_budget_watchdog(agent, run_id)
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         from tools.thread_context import propagate_context_to_thread
@@ -889,15 +916,34 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
-    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+    # Publish the flag before the status so an executor that checks the flag
+    # after reading "stopping" can never miss it.
     self._stopping_run_ids.add(run_id)
+    self._set_run_status(run_id, "stopping", last_event="run.stopping")
+    # Keep a local reference: completion may retire the run before we acquire.
+    entry_lock = self._run_entry_locks.get(run_id)
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+    if entry_lock is not None:
+        # A running turn was interrupted above. Wait briefly, off the event loop, for
+        # it to leave the entry lock: then either the executor saw the flag before
+        # entry or its turn has exited. A turn that ignores the interrupt keeps the
+        # lock; the response stays "stopping" and the executor settles the status.
+        with suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.to_thread(_wait_for_run_entry, entry_lock),
+                timeout=_RUN_STOP_ENTRY_WAIT_SECONDS)
     return web.json_response({"run_id": run_id, "status": "stopping"})
+
+
+def _wait_for_run_entry(entry_lock: threading.Lock) -> None:
+    """Block until an admitted turn leaves its entry lock (runs in a worker thread)."""
+    with entry_lock:
+        pass
 
 
 async def _sweep_orphaned_runs(self) -> None:
