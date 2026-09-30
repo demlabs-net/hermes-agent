@@ -1,13 +1,17 @@
 """Durable ``/v1/runs`` admission, status, events, and control handlers."""
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import logging
 import os
 import threading
 import time
 import uuid
+from urllib.parse import quote
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -24,6 +28,12 @@ from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
+_TICKET_FIELDS = (
+    "v", "aud", "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
+    "payload_sha256", "transport_key", "attempt_no", "issued_at", "expires_at")
+_WORKFLOW_TICKET_HEADER = "X-Hermes-Workflow-Ticket"
+# A stop is a request, not proof that a cooperative turn has exited.
+_RUN_STOP_ENTRY_WAIT_SECONDS = 1.0
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -44,9 +54,6 @@ _FIXED_EVENT_FIELDS = {
     "tool.completed": lambda tool, preview, kw: {
         "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
-# How long /stop waits for a turn that already crossed the entry lock to exit.
-# Past it the response stays "stopping"; the run is not reported cancelled.
-_RUN_STOP_ENTRY_WAIT_SECONDS = 1.0
 
 
 def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
@@ -65,6 +72,51 @@ def _room_retention_until(request: "web.Request") -> float:
     return max(0.0, float(value or 0))
 
 
+def _decode_ticket(ticket: str, *, secret: str, raw_body: bytes | None, profile: str,
+                   transport_key: str | None, allow_expired: bool = False) -> dict[str, Any]:
+    """Verify SLC's signed READY ticket without reserializing its signed bytes."""
+    if not isinstance(ticket, str) or len(ticket) > 8192 or ticket.count(".") != 1 or not secret:
+        raise ValueError("Invalid workflow ticket")
+    encoded, signature = ticket.split(".")
+    try:
+        def decode(segment):
+            if not segment or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                                  for c in segment):
+                raise ValueError("Invalid base64url ticket")
+            return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
+        raw_signature = decode(signature)
+        signed = ("slc-attempt-v1." + encoded).encode("ascii")
+        expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).digest()
+        if len(raw_signature) != 32 or not hmac.compare_digest(raw_signature, expected):
+            raise ValueError("Invalid workflow signature")
+        raw = decode(encoded)
+        claims = json.loads(raw)
+        if not isinstance(claims, dict) or tuple(claims) != _TICKET_FIELDS:
+            raise ValueError("Invalid workflow fields")
+        if type(claims["v"]) is not int or claims["v"] != 1 or claims["aud"] != "Hermes workflow":
+            raise ValueError("Invalid workflow audience")
+        for key in ("attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
+                    "payload_sha256", "transport_key"):
+            if not isinstance(claims[key], str) or not claims[key] or len(claims[key]) > 512:
+                raise ValueError("Invalid workflow identity")
+        if type(claims["attempt_no"]) is not int or claims["attempt_no"] < 1:
+            raise ValueError("Invalid workflow attempt")
+        issued, expires = claims["issued_at"], claims["expires_at"]
+        if (type(issued) not in (int, float) or type(expires) not in (int, float)
+                or issued > time.time() or (not allow_expired and time.time() >= expires)
+                or expires <= issued or expires - issued > 86400):
+            raise ValueError("Expired workflow ticket")
+        digest = claims["payload_sha256"]
+        if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
+                or claims["profile"] != profile
+                or (transport_key is not None and claims["transport_key"] != transport_key)
+                or (raw_body is not None and not hmac.compare_digest(digest, hashlib.sha256(raw_body).hexdigest()))):
+            raise ValueError("Workflow request binding mismatch")
+        return claims
+    except (UnicodeError, TypeError, KeyError, OverflowError, binascii.Error, json.JSONDecodeError) as exc:
+        raise ValueError("Invalid workflow ticket") from exc
+
+
 def _run_event(run_id: str, name: str, **fields: Any) -> Dict[str, Any]:
     """Build one SSE event payload (key order is part of the wire format)."""
     return {"event": name, "run_id": run_id, "timestamp": time.time(), **fields}
@@ -72,6 +124,121 @@ def _run_event(run_id: str, name: str, **fields: Any) -> Dict[str, Any]:
 
 def _run_not_found(_openai_error, run_id: str) -> "web.Response":
     return _json_error(_openai_error, f"Run not found: {run_id}", code="run_not_found", status=404)
+
+
+def _check_workflow_service_auth(self, request: "web.Request") -> "web.Response | None":
+    """Workflow dispatch uses an independent service credential, never the UI API key."""
+    from gateway.platforms._shared import get_scoped_secret
+    expected = get_scoped_secret("HERMES_WORKFLOW_SERVICE_KEY", "")
+    if not expected:
+        return web.json_response({"error": "Workflow service authentication unavailable"}, status=503)
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer ") or not hmac.compare_digest(
+        authorization[7:].strip().encode(), expected.encode()
+    ):
+        return web.json_response({"error": "Invalid workflow service authentication"}, status=401)
+    return None
+
+
+def _workflow_config(self) -> tuple[str, str, str, str]:
+    """A workflow is never admitted unless both sides of the release gate are configured."""
+    from gateway.platforms._shared import get_scoped_secret
+    return (get_scoped_secret("SLC_ATTEMPT_SIGNING_SECRET", ""),
+            get_scoped_secret("HERMES_WORKFLOW_SERVICE_KEY", ""),
+            self._workflow_slc_url or get_scoped_secret("SLC_ATTEMPT_VERIFY_URL", ""),
+            get_scoped_secret("SLC_ATTEMPT_VERIFY_TOKEN", ""))
+
+
+def _workflow_request_profile(_api_server) -> str:
+    profile = _api_server._api_request_profile.get()
+    if profile:
+        return profile
+    from hermes_cli.profiles import get_active_profile_name
+    return get_active_profile_name()
+
+
+def _workflow_protected(self, _api_server) -> bool:
+    return _workflow_request_profile(_api_server) in self._workflow_protected_profiles
+
+
+def _workflow_locally_ready(self) -> bool:
+    """Check only Hermes' local machinery; do not depend on SLC's capability probe."""
+    from urllib.parse import urlsplit
+    try:
+        secret, service_key, url, token = _workflow_config(self)
+        parsed = urlsplit(url)
+        return bool(all((secret, service_key, token, parsed.hostname))
+                    and parsed.scheme in ("http", "https") and not (parsed.username or parsed.password
+                    or parsed.query or parsed.fragment)
+                    and self._run_idempotency_store.durable)
+    except Exception:
+        return False
+
+
+async def _handle_workflow_readiness(self, request, *, _api_server):
+    auth = _check_workflow_service_auth(self, request)
+    if auth is not None:
+        return auth
+    profile = _workflow_request_profile(_api_server)
+    protected = _workflow_protected(self, _api_server)
+    ready = protected and _workflow_locally_ready(self)
+    return web.json_response({"profile": profile, "protected": protected,
+                              "workflow_admission_enabled": ready,
+                              "generic_runs_denied": protected})
+
+
+async def _workflow_capable(url: str, token: str) -> bool:
+    import aiohttp
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+            async with session.get(url.rstrip("/") + "/internal/task-attempts/capabilities",
+                                   headers={"Authorization": "Bearer " + token}) as response:
+                return response.status == 200 and (await response.json()).get("admission_ready") is True
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def _workflow_scope(profile: str) -> str:
+    return hashlib.sha256(("workflow\0" + profile).encode()).hexdigest()
+
+
+def _workflow_fingerprint(claims: dict[str, Any]) -> str:
+    # Ticket renewal may move the signed timestamps without changing the
+    # attempt or payload. Identity and transport binding must remain fixed.
+    binding = {key: claims[key] for key in (
+        "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
+        "payload_sha256", "transport_key", "attempt_no")}
+    return hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _workflow_expected(claims: dict[str, Any], run_id: str) -> dict[str, Any]:
+    return {key: claims[key] for key in (
+        "attempt_id", "task_id", "assignee", "profile")} | {"run_id": run_id, "admitted": True}
+
+
+async def _wait_for_workflow_release(claims: dict[str, Any], run_id: str, url: str, token: str,
+                                     stopped: Callable[[], bool]) -> bool:
+    """Read-only SLC verification; all transport and identity failures leave the run held."""
+    import aiohttp
+    endpoint = (url.rstrip("/") + "/internal/task-attempts/" + quote(claims["attempt_id"], safe="")
+                + "/admission?run_id=" + quote(run_id, safe=""))
+    timeout = aiohttp.ClientTimeout(total=3)
+    deadline = time.monotonic() + 1800  # bounded inactivity; never interpret an error as release
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        while not stopped() and time.monotonic() < deadline:
+            try:
+                async with session.get(endpoint, headers={"Authorization": "Bearer " + token}) as response:
+                    if response.status == 200:
+                        body = await response.json()
+                        expected = _workflow_expected(claims, run_id)
+                        if (isinstance(body, dict) and all(type(body.get(k)) is type(v) and body[k] == v
+                                                          for k, v in expected.items())
+                                and isinstance(body.get("start_event_id"), str) and body["start_event_id"]):
+                            return True
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+                pass
+            await asyncio.sleep(0.5)
+    return False
 
 
 def _uses_room_run_auth(self, request: "web.Request") -> bool:
@@ -92,10 +259,12 @@ def _initialize_run_state(self, *, store_factory) -> None:
     # outlive the request, hence the separate stopping set), pollable statuses, and
     # approval session keys (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
+    self._workflow_run_ids: set[str] = set()
     self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
-    # Per-run lock held across the executor's final stop check and its turn entry,
-    # so /stop can never acknowledge a turn that is about to start.
+    # The executor holds this lock across final admission and the turn itself.
+    # Stop signals immediately, then waits off-loop before ACKing a turn that
+    # already entered. The lock is never held by the event-loop thread.
     self._run_entry_locks: dict[str, threading.Lock] = {}
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
@@ -105,7 +274,11 @@ def _initialize_run_state(self, *, store_factory) -> None:
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
-        ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("POST", "/v1/runs", self._handle_runs),
+        ("GET", "/v1/workflow-profile/readiness", self._handle_workflow_readiness),
+        ("GET", "/v1/workflow-attempts/{attempt_id}", self._handle_workflow_attempt),
+        ("POST", "/v1/workflow-attempts/{attempt_id}/abort", self._handle_abort_workflow_attempt),
+        ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
@@ -148,6 +321,14 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
             self._run_idempotency_store.update_status(run_id, current)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
+    if run_id in self._workflow_run_ids and should_persist:
+        # A terminal result is not inactive until agent.close and child cleanup finish.
+        try:
+            existing = self._run_idempotency_store.workflow_registry_for_run(self._run_owners[run_id], run_id)
+            if existing is not None and existing["active"]:
+                self._run_idempotency_store.update_workflow_status(run_id, current, active=True)
+        except Exception:
+            logger.exception("[api_server] failed to persist workflow run status %s", run_id)
     return current
 
 
@@ -201,6 +382,8 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
             "room_id", "home_install_id", "authority_gateway_id", "authority_epoch",
             "member_id", "target_install_id", "target_profile"))
     else:
+        if _check_workflow_service_auth(self, request) is None:
+            return _workflow_scope(_workflow_request_profile(_api_server))
         parts = (_api_server._api_request_profile.get() or "default",
                  self._expected_api_key() or "unauthenticated-test-listener")
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()
@@ -208,6 +391,9 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
 
 def _check_run_auth(self, request: "web.Request", *, permission: str, _api_server) -> "web.Response | None":
     if not self._room_grant_token(request):
+        service = _check_workflow_service_auth(self, request)
+        if service is None:
+            return None
         return self._check_auth(request)
     try:
         self._room_grant_claims(request, permission=permission)
@@ -237,17 +423,34 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     scope = self._run_idempotency_scope(request)
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
+    service_authorized = _check_workflow_service_auth(self, request) is None
+    if record is None and service_authorized:
+        record = self._run_idempotency_store.workflow_status_for_run(scope, run_id)
     if record is None:
         return None
     status = dict(record["status"])
+    workflow = self._run_idempotency_store.workflow_registry_for_run(scope, run_id) if (
+        service_authorized) else None
+    if workflow is not None and not workflow["active"]:
+        # The already-cleaned durable binding is authoritative; stale in-process
+        # status must not overwrite terminal inactivity after restart.
+        status = dict(record["status"])
     if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
+        if workflow is not None:
+            # A dead owner does not prove its descendants are gone: stay active
+            # until child-process cleanup is positively observed.
+            self._run_idempotency_store.update_workflow_status(run_id, status, active=workflow["active"])
+        else:
+            self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
-    self._run_idempotency_ids.add(run_id)
+    if workflow is not None:
+        self._workflow_run_ids.add(run_id)
+    else:
+        self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope
     return status
 
@@ -334,6 +537,9 @@ class _RunLaunch:
     request_profile: Any
     browser_control_principal: Any
     browser_control_transport_family: Any
+    workflow_claims: Optional[dict] = None
+    workflow_url: str = ""
+    workflow_token: str = ""
 
     @property
     def approval_session_key(self) -> str:
@@ -382,6 +588,18 @@ async def _resolve_live_session_id(self, session_id: str) -> str:
 
 async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs — start an agent run, return run_id immediately."""
+    protected = _workflow_protected(self, _api_server)
+    if protected and _WORKFLOW_TICKET_HEADER not in request.headers:
+        return _json_error(_api_server._openai_error, "Protected profile requires workflow ticket",
+                           code="workflow_ticket_required", status=403)
+    if _WORKFLOW_TICKET_HEADER in request.headers:
+        from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+        try:
+            with run_scope():
+                require_generation(request.headers.get("X-Hermes-Operator-Generation"))
+                return await _handle_workflow_runs(self, request, _api_server=_api_server)
+        except OperatorHoldError as exc:
+            return _json_error(_api_server._openai_error, str(exc), code="operator_hold", status=503)
     from agent.operator_hold import run_scope, OperatorHoldError, require_generation
     try:
         with run_scope():
@@ -391,7 +609,38 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         return _json_error(_api_server._openai_error, str(exc), code="operator_hold", status=503)
 
 
-async def _handle_admitted_runs(self, request, *, _api_server):
+async def _handle_workflow_runs(self, request, *, _api_server):
+    """Authorize and reserve an SLC attempt; a signed READY ticket alone cannot execute."""
+    from agent.operator_hold import require_released
+    unavailable = lambda: _json_error(_api_server._openai_error, "Workflow admission unavailable",
+                                      code="workflow_admission_unavailable", status=503)
+    auth_error = _check_workflow_service_auth(self, request)
+    if auth_error is not None:
+        return auth_error
+    try:
+        if not _workflow_protected(self, _api_server) or not _workflow_locally_ready(self):
+            return unavailable()
+        secret, _, url, token = _workflow_config(self)
+        if self._room_grant_token(request):
+            return _json_error(_api_server._openai_error, "Workflow room dispatch unsupported", status=401)
+        raw = await request.read()
+        profile = _workflow_request_profile(_api_server)
+        claims = _decode_ticket(request.headers[_WORKFLOW_TICKET_HEADER], secret=secret, raw_body=raw,
+                                profile=profile, transport_key=request.headers.get("Idempotency-Key", ""))
+        if not await _workflow_capable(url, token):
+            return unavailable()
+        require_released("workflow run reservation")
+    except ValueError:
+        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
+    except Exception:
+        logger.exception("Workflow admission configuration unavailable")
+        return unavailable()
+    return await _handle_admitted_runs(self, request, _api_server=_api_server,
+                                       workflow_claims=claims, workflow_url=url, workflow_token=token)
+
+
+async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=None,
+                                workflow_url="", workflow_token=""):
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -401,6 +650,8 @@ async def _handle_admitted_runs(self, request, *, _api_server):
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    if not isinstance(body, dict):
+        return _json_error(_openai_error, "Expected a JSON object", status=400)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -414,7 +665,14 @@ async def _handle_admitted_runs(self, request, *, _api_server):
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
     idempotency_scope = idempotency_fingerprint = ""
-    if idempotency_key:
+    if workflow_claims is not None:
+        if (self._room_grant_token(request) or not idempotency_key or
+                idempotency_key != workflow_claims["transport_key"] or gateway_session_key
+                or body.get("hosted_room_dispatch") or body.get("_room_execution_policy")):
+            return _json_error(_openai_error, "Workflow request binding mismatch", status=401)
+        idempotency_scope = _workflow_scope(workflow_claims["profile"])
+        idempotency_fingerprint = _workflow_fingerprint(workflow_claims)
+    elif idempotency_key:
         idempotency_scope = self._run_idempotency_scope(request)
         idempotency_fingerprint = hashlib.sha256(json.dumps(
             {"body": body, "gateway_session_key": gateway_session_key or ""},
@@ -445,7 +703,18 @@ async def _handle_admitted_runs(self, request, *, _api_server):
         return _json_error(_openai_error, selection_error, status=400)
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if idempotency_key:
+    if workflow_claims is not None:
+        outcome, record = self._run_idempotency_store.lookup_workflow(
+            workflow_claims["task_id"], workflow_claims["attempt_no"], workflow_claims["attempt_id"],
+            idempotency_scope, idempotency_fingerprint, workflow_claims["transport_key"])
+        if outcome != "missing":
+            if outcome == "aborted":
+                return _json_error(_openai_error, "Workflow attempt aborted", code="workflow_attempt_aborted", status=409)
+            if outcome == "conflict":
+                return _json_error(_openai_error, "Workflow attempt binding conflict", status=409)
+            return _accepted_response(record["run_id"], record["status"]["status"],
+                                      gateway_session_key, replayed=True)
+    elif idempotency_key:
         outcome, record = self._run_idempotency_store.lookup(
             idempotency_scope, idempotency_key, idempotency_fingerprint,
             retention_until=_room_retention_until(request))
@@ -456,7 +725,7 @@ async def _handle_admitted_runs(self, request, *, _api_server):
     if limited is not None:
         return limited
     run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
+    self._run_owners[run_id] = idempotency_scope if workflow_claims else self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
@@ -486,8 +755,34 @@ async def _handle_admitted_runs(self, request, *, _api_server):
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
-        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
-    if idempotency_key:
+        run_id, "held" if workflow_claims else "queued", created_at=created_at,
+        session_id=session_id, model=body.get("model", self._model_name))
+    if workflow_claims is not None:
+        registry = {key: workflow_claims[key] for key in (
+            "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+            "payload_sha256", "transport_key")}
+        registry.update(run_id=run_id, status="held", active=True)
+        try:
+            outcome, record = self._run_idempotency_store.reserve_workflow(
+                workflow_claims["task_id"], workflow_claims["attempt_no"], idempotency_scope,
+                idempotency_fingerprint, run_id, initial_status, registry,
+                owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
+        except Exception:
+            logger.exception("Workflow durable reservation failed")
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            return _json_error(_openai_error, "Workflow reservation unavailable", status=503)
+        if outcome != "created":
+            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
+                        self._run_approval_sessions, self._run_statuses, self._run_owners)
+            if outcome == "aborted":
+                return _json_error(_openai_error, "Workflow attempt aborted", code="workflow_attempt_aborted", status=409)
+            if outcome == "conflict":
+                return _json_error(_openai_error, "Workflow attempt binding conflict", status=409)
+            return _accepted_response(record["run_id"], record["status"]["status"],
+                                      gateway_session_key, replayed=True)
+        self._workflow_run_ids.add(run_id)
+    elif idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
@@ -507,7 +802,8 @@ async def _handle_admitted_runs(self, request, *, _api_server):
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get())
+        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
+        workflow_claims=workflow_claims, workflow_url=workflow_url, workflow_token=workflow_token)
     self._activate_admitted_request()
     self._run_entry_locks[run_id] = threading.Lock()
     task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
@@ -515,7 +811,8 @@ async def _handle_admitted_runs(self, request, *, _api_server):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    return _accepted_response(run_id, "held" if workflow_claims else "started",
+                              gateway_session_key, replayed=False)
 
 
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
@@ -571,11 +868,11 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             _api_server._publish_turn_process_ownership(
                 agent, effective_task_id, session_key=run.approval_session_key,
             )
-            # The stop flag and the method invocation share one admission boundary:
-            # holding this per-run lock across the call means a stop that arrives after
-            # the check cannot be acknowledged while a not-yet-entered turn might still
-            # run hooks. The stop path interrupts first, then waits for this lock in a
-            # worker thread (never on the event loop).
+            # The stop flag and the method invocation must share one admission
+            # boundary. Holding this per-run lock for the call means a stop that
+            # arrives after the check cannot ACK while a not-yet-entered turn
+            # might still execute hooks. The stop path signals interruption
+            # before waiting for this lock in a worker (never on the event loop).
             with self._run_entry_locks[run.run_id]:
                 if run.run_id in self._stopping_run_ids:
                     return {"interrupted": True}, {}
@@ -583,7 +880,29 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                     user_message=run.user_message, conversation_history=run.conversation_history,
                     task_id=effective_task_id)
         finally:
-            if self._reap_background_processes_on_run_completion:
+            if run.workflow_claims is not None:
+                # A daemon reaper is not cleanup proof: SLC must never see
+                # active=false while descendants can still execute. Keep the
+                # registry active on a failed/unfinished reap.
+                agent._workflow_cleanup_verified = False
+                try:
+                    from gateway.run import _reap_gateway_turn_processes
+                    from tools.process_registry import process_registry
+                    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
+                    session_key = getattr(agent, "_gateway_turn_process_session_key", "")
+                    baseline = getattr(agent, "_gateway_turn_process_baseline", None)
+                    if not task_id and baseline is None:
+                        # Stopped before turn entry: no process ownership was published.
+                        agent._workflow_cleanup_verified = True
+                    elif task_id and baseline is not None:
+                        _reap_gateway_turn_processes(
+                            task_id, baseline, source="api_server_workflow_completion",
+                            session_key=session_key)
+                        agent._workflow_cleanup_verified = not (
+                            process_registry.snapshot_running_ids(task_id, session_key=session_key) - baseline)
+                except Exception:
+                    logger.exception("Workflow process cleanup failed for %s", run.run_id)
+            elif self._reap_background_processes_on_run_completion:
                 _api_server._reap_disconnected_agent_processes(
                     agent, source="api_server_run_completion",
                 )
@@ -646,7 +965,16 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
 
     agent = None
     run_budget_watchdog = None
+    executor_finished = True
     try:
+        if run.workflow_claims is not None:
+            released = await _wait_for_workflow_release(
+                run.workflow_claims, run_id, run.workflow_url, run.workflow_token,
+                lambda: run_id in self._stopping_run_ids)
+            if not released:
+                _finish("cancelled")
+                return
+            # No agent construction, hooks or tools can occur before the exact SLC Started binding.
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
@@ -656,18 +984,37 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                 stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
                 **run.agent_kwargs)
         self._active_run_agents[run_id] = agent
-        # /stop may have run during synchronous _create_agent, before there was an
-        # agent to interrupt. No await occurs between this check and dispatch; the
-        # executor also checks the stopping flag at its own entry boundary.
+        # /stop may have run during synchronous _create_agent, before there was
+        # an agent to interrupt. No await occurs between this check and dispatch;
+        # the executor also checks the stopping flag at its own entry boundary.
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
         run_budget_watchdog = _api_server._start_api_run_budget_watchdog(agent, run_id)
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         from tools.thread_context import propagate_context_to_thread
-        result, usage = await loop.run_in_executor(
+        executor_finished = False
+        executor = loop.run_in_executor(
             None, propagate_context_to_thread(
                 lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server)))
+        try:
+            result, usage = await asyncio.shield(executor)
+            executor_finished = True
+        except asyncio.CancelledError:
+            # A cancelled coroutine is not proof that its executor thread (and
+            # children) have stopped. Keep the binding active until it returns.
+            _unregister_approval_notify(run.approval_session_key)
+            with suppress(Exception):
+                _api_server.request_hard_interrupt(agent, "Run cancelled")
+            try:
+                await asyncio.shield(executor)
+            except Exception:
+                pass
+            executor_finished = executor.done()
+            raise
+        except Exception:
+            executor_finished = executor.done()
+            raise
         if not isinstance(result, dict):
             result = {}
         if run_id in self._stopping_run_ids and result.get("interrupted") is True:
@@ -697,12 +1044,22 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         _unregister_approval_notify(run.approval_session_key)
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
-        _retire_live_run(self, run_id)
         if agent is not None:
             try:
                 agent.close()
             except Exception:
                 logger.debug("[api_server] agent close failed for run=%s", run_id, exc_info=True)
+                executor_finished = False
+        if run.workflow_claims is not None and executor_finished and (
+            agent is None or getattr(agent, "_workflow_cleanup_verified", False)
+        ):
+            try:
+                status = self._run_statuses.get(run_id)
+                if status and status.get("status") in TERMINAL_STATUSES:
+                    self._run_idempotency_store.update_workflow_status(run_id, status, active=False)
+            except Exception:
+                logger.exception("Workflow terminal cleanup could not be persisted for %s", run_id)
+        _retire_live_run(self, run_id)
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -732,7 +1089,9 @@ def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    return self._run_idempotency_store.owns_run(scope, run_id)
+    return (self._run_idempotency_store.owns_run(scope, run_id)
+            or (_check_workflow_service_auth(self, request) is None
+                and self._run_idempotency_store.workflow_status_for_run(scope, run_id) is not None))
 
 
 def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
@@ -756,6 +1115,73 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     return run_id, status, agent, task, None
 
 
+async def _handle_abort_workflow_attempt(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Service-authenticated, durable pre-POST fence for an SLC reserved attempt."""
+    auth = _check_workflow_service_auth(self, request)
+    if auth is not None:
+        return auth
+    unavailable = lambda: _json_error(_api_server._openai_error, "Workflow abort unavailable", status=503)
+    try:
+        secret, service_key, _, _ = _workflow_config(self)
+        if not secret or not service_key or not self._run_idempotency_store.durable:
+            return unavailable()
+        body = await request.json()
+        if not isinstance(body, dict) or set(body) != {"ticket"}:
+            raise ValueError("Invalid abort body")
+        profile = _workflow_request_profile(_api_server)
+        claims = _decode_ticket(body["ticket"], secret=secret, raw_body=None,
+                                profile=profile, transport_key=None, allow_expired=True)
+        if claims["attempt_id"] != request.match_info["attempt_id"]:
+            raise ValueError("Workflow attempt mismatch")
+    except ValueError:
+        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
+    except (TypeError, KeyError):
+        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
+    except Exception:
+        logger.exception("Workflow abort configuration unavailable")
+        return unavailable()
+    registry = {key: claims[key] for key in (
+        "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+        "payload_sha256", "transport_key")}
+    try:
+        outcome, record = self._run_idempotency_store.abort_workflow(
+            registry, _workflow_scope(profile), _workflow_fingerprint(claims))
+    except Exception:
+        logger.exception("Workflow abort durable reservation failed")
+        return unavailable()
+    if outcome == "admitted":
+        return web.json_response({"error": "Workflow attempt already admitted", "run_id": record["run_id"],
+                                  "status": record["status"], "active": record["active"]}, status=409)
+    if outcome == "conflict":
+        return _json_error(_api_server._openai_error, "Workflow attempt binding conflict", status=409)
+    return web.json_response(record)
+
+
+async def _handle_workflow_attempt(self, request: "web.Request", *, _api_server) -> "web.Response":
+    """Service-only authoritative view of a durable, never-pruned attempt binding."""
+    auth = _check_workflow_service_auth(self, request)
+    if auth is not None:
+        return auth
+    try:
+        record = self._run_idempotency_store.workflow_registry(request.match_info["attempt_id"])
+    except Exception:
+        logger.exception("Workflow registry read failed")
+        return _json_error(_api_server._openai_error, "Workflow registry unavailable", status=503)
+    if record is None or record["profile"] != _workflow_request_profile(_api_server):
+        return _json_error(_api_server._openai_error, "Workflow attempt not found", status=404)
+    if record.get("status") == "aborted" and record.get("aborted") is True and record.get("run_id") is None:
+        return web.json_response(record)
+    run_id = record["run_id"]
+    scope = _workflow_scope(record["profile"])
+    try:
+        stored = self._run_idempotency_store.workflow_status_for_run(scope, run_id)
+    except Exception:
+        return _json_error(_api_server._openai_error, "Workflow registry unavailable", status=503)
+    if stored is None:
+        return _json_error(_api_server._openai_error, "Workflow attempt not found", status=404)
+    return web.json_response(record)
+
+
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
@@ -765,7 +1191,7 @@ async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.
 
 async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
-    auth_err = self._check_auth(request)
+    auth_err = self._check_run_auth(request, permission="status")
     if auth_err is not None:
         return auth_err
     run_id = request.match_info["run_id"]
@@ -903,6 +1329,12 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
 
+def _wait_for_run_entry(entry_lock: threading.Lock) -> None:
+    """Wait for an admitted turn to exit without blocking the HTTP event loop."""
+    with entry_lock:
+        pass
+
+
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
@@ -916,8 +1348,6 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
-    # Publish the flag before the status so an executor that checks the flag
-    # after reading "stopping" can never miss it.
     self._stopping_run_ids.add(run_id)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
     # Keep a local reference: completion may retire the run before we acquire.
@@ -929,21 +1359,16 @@ async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
     if entry_lock is not None:
-        # A running turn was interrupted above. Wait briefly, off the event loop, for
-        # it to leave the entry lock: then either the executor saw the flag before
-        # entry or its turn has exited. A turn that ignores the interrupt keeps the
-        # lock; the response stays "stopping" and the executor settles the status.
-        with suppress(asyncio.TimeoutError):
+        # The lock covers both the last pre-entry check and the whole turn. A
+        # timed-out wait cannot distinguish those cases: leave the stop flag,
+        # live refs and pollable status intact until the executor actually exits.
+        try:
             await asyncio.wait_for(
                 asyncio.to_thread(_wait_for_run_entry, entry_lock),
                 timeout=_RUN_STOP_ENTRY_WAIT_SECONDS)
+        except asyncio.TimeoutError:
+            pass
     return web.json_response({"run_id": run_id, "status": "stopping"})
-
-
-def _wait_for_run_entry(entry_lock: threading.Lock) -> None:
-    """Block until an admitted turn leaves its entry lock (runs in a worker thread)."""
-    with entry_lock:
-        pass
 
 
 async def _sweep_orphaned_runs(self) -> None:
@@ -962,7 +1387,7 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     orphaned = [
         (run_id, status, self._active_run_tasks.get(run_id))
         for run_id, status in list(self._run_statuses.items())
-        if status.get("status") in {"queued", "running", "waiting_for_approval", "stopping"}
+        if status.get("status") in {"held", "queued", "running", "waiting_for_approval", "stopping"}
         and (
             self._active_run_tasks.get(run_id) is None
             or self._active_run_tasks[run_id].done()
@@ -989,6 +1414,10 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             with suppress(Exception):
                 queue.put_nowait(event)
                 queue.put_nowait(None)
+        if run_id in self._workflow_run_ids:
+            # A done/cancelled coroutine does not prove an executor thread and its
+            # children exited. Only _execute_run's cleanup may mark inactive.
+            continue
         _unregister_approval_notify(self._run_approval_sessions.get(run_id))
         _retire_live_run(self, run_id)
     for run_id, created_at in list(self._run_streams_created.items()):
@@ -1004,4 +1433,5 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
-            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids,
+                        self._workflow_run_ids)

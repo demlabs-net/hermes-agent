@@ -932,7 +932,9 @@ def _admit_api_agent_request(handler):
     @wraps(handler)
     async def _wrapped(self, request, *args, **kwargs):
         auth_err = (
-            self._check_run_auth(request, permission="dispatch")
+            _api_runs._check_workflow_service_auth(self, request)
+            if request.path.endswith("/v1/runs") and "X-Hermes-Workflow-Ticket" in getattr(request, "headers", {})
+            else self._check_run_auth(request, permission="dispatch")
             if _api_runs._uses_room_run_auth(self, request)
             else self._check_auth(request))
         if auth_err is not None:
@@ -1167,6 +1169,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
+        # Explicit server-side run admission policy. A profile on this list cannot
+        # submit an ordinary /v1/runs request, even with the UI/manager bearer key.
+        protected = extra.get("workflow_protected_profiles", [])
+        if not isinstance(protected, list) or any(
+            not isinstance(name, str) or not name or name != name.strip() for name in protected
+        ):
+            raise ValueError("api_server.workflow_protected_profiles must be a list of profile names")
+        self._workflow_protected_profiles = frozenset(protected)
+        self._workflow_slc_url = extra.get("workflow_slc_url", "")
         self._app: Optional["web.Application"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
@@ -3830,6 +3841,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         _api_runs._release_run_owner_if_forgotten(self, run_id)
 
+    _handle_workflow_readiness = _run_route_delegate("_handle_workflow_readiness")
+    _handle_workflow_attempt = _run_route_delegate("_handle_workflow_attempt")
+    _handle_abort_workflow_attempt = _run_route_delegate("_handle_abort_workflow_attempt")
     _handle_get_run = _run_route_delegate("_handle_get_run")
     _handle_run_events = _run_route_delegate("_handle_run_events")
     _handle_run_approval = _run_route_delegate("_handle_run_approval")

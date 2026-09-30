@@ -172,6 +172,9 @@ def test_roomlink_and_run_route_tuples_are_shard_owned():
     ]
     assert [(method, path) for method, path, _ in run_routes] == [
         ("POST", "/v1/runs"),
+        ("GET", "/v1/workflow-profile/readiness"),
+        ("GET", "/v1/workflow-attempts/{attempt_id}"),
+        ("POST", "/v1/workflow-attempts/{attempt_id}/abort"),
         ("GET", "/v1/runs/{run_id}"),
         ("GET", "/v1/runs/{run_id}/events"),
         ("POST", "/v1/runs/{run_id}/approval"),

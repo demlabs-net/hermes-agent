@@ -10,7 +10,11 @@ Covers:
 """
 
 import asyncio
+import base64
 import hashlib
+import hmac
+import json
+import sqlite3
 import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,10 +28,10 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     _api_request_profile,
     _approval_event_choices,
-    _publish_turn_process_ownership,
     _start_api_run_budget_watchdog,
     cors_middleware,
     security_headers_middleware,
+    _publish_turn_process_ownership,
 )
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
@@ -129,6 +133,9 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/workflow-profile/readiness", adapter._handle_workflow_readiness)
+    app.router.add_get("/v1/workflow-attempts/{attempt_id}", adapter._handle_workflow_attempt)
+    app.router.add_post("/v1/workflow-attempts/{attempt_id}/abort", adapter._handle_abort_workflow_attempt)
     app.router.add_post(
         "/v1/room-members/invitations",
         adapter._handle_room_member_invitation,
@@ -1372,6 +1379,472 @@ def _use_idempotency_db(adapter, path):
 
     adapter._run_idempotency_store.close()
     adapter._run_idempotency_store = RunIdempotencyStore(str(path))
+
+
+class TestWorkflowAdmissionStaging:
+    def test_protected_profiles_are_explicit_server_configuration(self):
+        configured = APIServerAdapter(PlatformConfig(enabled=True, extra={
+            "workflow_protected_profiles": ["crm"]}))
+        assert configured._workflow_protected_profiles == frozenset({"crm"})
+        assert _make_adapter()._workflow_protected_profiles == frozenset()
+        with pytest.raises(ValueError):
+            APIServerAdapter(PlatformConfig(enabled=True, extra={
+                "workflow_protected_profiles": "crm"}))
+
+    @pytest.fixture(autouse=True)
+    def protected_profile(self, adapter):
+        adapter._workflow_protected_profiles = frozenset({"default"})
+
+    @pytest.mark.asyncio
+    async def test_protected_profile_denies_generic_manager_bearer_and_readiness_is_local(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        _use_idempotency_db(adapter, tmp_path / "runs.db")
+        adapter._api_key = "manager-key"
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                denied = await cli.post("/v1/runs", json={"input": "bypass"},
+                    headers={"Authorization": "Bearer manager-key"})
+                assert denied.status == 403
+                assert (await denied.json())["error"]["code"] == "workflow_ticket_required"
+                create.assert_not_called()
+            url = "/v1/workflow-profile/readiness"
+            assert (await cli.get(url, headers={"Authorization": "Bearer manager-key"})).status == 401
+            ready = await cli.get(url, headers={"Authorization": "Bearer service-secret"})
+            assert ready.status == 200
+            assert await ready.json() == {
+                "profile": "default", "protected": True, "workflow_admission_enabled": True,
+                "generic_runs_denied": True}
+            monkeypatch.delenv("SLC_ATTEMPT_VERIFY_TOKEN")
+            not_ready = await cli.get(url, headers={"Authorization": "Bearer service-secret"})
+            assert (await not_ready.json())["workflow_admission_enabled"] is False
+            assert (await cli.post("/v1/runs", json={"input": "bypass"},
+                headers={"Authorization": "Bearer manager-key"})).status == 403
+
+    @pytest.mark.asyncio
+    async def test_workflow_ticket_fails_closed_without_slc_capability(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        from gateway.platforms import api_server_runs
+        _use_idempotency_db(adapter, tmp_path / "runs.db")
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        raw = b'{"input":"do work"}'
+        ticket, _ = self._ticket(raw)
+        with patch.object(api_server_runs, "_workflow_capable", AsyncMock(return_value=False)):
+            async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+                response = await cli.post("/v1/runs", data=raw, headers={
+                    "Authorization": "Bearer service-secret", "X-Hermes-Workflow-Ticket": ticket,
+                    "Idempotency-Key": "ticket-key"})
+                assert response.status == 503
+                assert adapter._run_idempotency_store.workflow_registry("attempt-1") is None
+
+    @staticmethod
+    def _ticket(raw_body: bytes, *, profile="default", key="ticket-key", secret="signing-secret"):
+        claims = {
+            "v": 1, "aud": "Hermes workflow", "attempt_id": "attempt-1",
+            "task_id": "task-1", "assignee": "agent-1", "profile": profile,
+            "queue_ready_event_id": "event-1", "payload_sha256": hashlib.sha256(raw_body).hexdigest(),
+            "transport_key": key, "attempt_no": 1,
+            "issued_at": int(time.time()) - 1, "expires_at": int(time.time()) + 120,
+        }
+        segment = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
+        signature = base64.urlsafe_b64encode(hmac.new(
+            secret.encode(), ("slc-attempt-v1." + segment).encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        return f"{segment}.{signature}", claims
+
+    @pytest.mark.asyncio
+    async def test_abort_receipt_fences_post_and_survives_restart(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms import api_server_runs
+        path = tmp_path / "runs.db"
+        _use_idempotency_db(adapter, path)
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        capable = AsyncMock(return_value=False)
+        monkeypatch.setattr(api_server_runs, "_workflow_capable", capable)
+        raw = b'{"input":"do work"}'
+        ticket, claims = self._ticket(raw)
+        auth = {"Authorization": "Bearer service-secret"}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            url = "/v1/workflow-attempts/attempt-1"
+            assert (await cli.post(url + "/abort", json={"ticket": ticket})).status == 401
+            assert (await cli.post(url + "/abort", headers=auth, json={"ticket": ticket + "x"})).status == 401
+            # Invalid base64 length is a bad ticket, not a service outage.
+            assert (await cli.post(url + "/abort", headers=auth, json={"ticket": "A.A"})).status == 401
+            assert (await cli.post("/v1/workflow-attempts/other/abort", headers=auth,
+                                   json={"ticket": ticket})).status == 401
+            assert (await cli.get(url)).status == 401
+            response = await cli.post(url + "/abort", headers=auth, json={"ticket": ticket})
+            assert response.status == 200
+            receipt = await response.json()
+            assert {k: receipt[k] for k in (
+                "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+                "payload_sha256", "transport_key")} == {k: claims[k] for k in (
+                "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+                "payload_sha256", "transport_key")}
+            assert receipt["status"] == "aborted" and receipt["active"] is False
+            assert receipt["run_id"] is None and receipt["aborted"] is True
+            assert receipt["abort_receipt"].startswith("abort_")
+            capable.assert_not_awaited()  # abort must work while SLC's admission capability is absent
+            capable.return_value = True
+            repeat = await cli.post(url + "/abort", headers=auth, json={"ticket": ticket})
+            assert repeat.status == 200 and await repeat.json() == receipt
+            assert await (await cli.get(url, headers=auth)).json() == receipt
+            with patch.object(adapter, "_create_agent") as create:
+                post = await cli.post("/v1/runs", data=raw, headers={
+                    **auth, "X-Hermes-Workflow-Ticket": ticket, "Idempotency-Key": "ticket-key"})
+                assert post.status == 409
+                create.assert_not_called()
+            reopened = RunIdempotencyStore(str(path))
+            try:
+                assert reopened.workflow_registry("attempt-1") == receipt
+                assert reopened.lookup_workflow("task-1", 1, "attempt-1",
+                    api_server_runs._workflow_scope("default"),
+                    api_server_runs._workflow_fingerprint(claims), "ticket-key")[0] == "aborted"
+                assert reopened.abort_workflow({k: receipt[k] for k in (
+                    "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+                    "payload_sha256", "transport_key")}, api_server_runs._workflow_scope("default"),
+                    api_server_runs._workflow_fingerprint(claims)) == ("aborted", receipt)
+            finally:
+                reopened.close()
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM workflow_run_binding").fetchone()[0] == 0
+            assert conn.execute("SELECT COUNT(*) FROM workflow_abort").fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_expired_ticket_can_abort_but_not_admit(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms import api_server_runs
+        _use_idempotency_db(adapter, tmp_path / "runs.db")
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        raw = b'{"input":"do work"}'
+        ticket, claims = self._ticket(raw)
+        claims["issued_at"] = int(time.time()) - 120
+        claims["expires_at"] = int(time.time()) - 1
+        segment = base64.urlsafe_b64encode(json.dumps(claims, separators=(",", ":")).encode()).decode().rstrip("=")
+        signature = base64.urlsafe_b64encode(hmac.new(
+            b"signing-secret", ("slc-attempt-v1." + segment).encode(), hashlib.sha256).digest()).decode().rstrip("=")
+        expired = segment + "." + signature
+        with pytest.raises(ValueError):
+            api_server_runs._decode_ticket(expired, secret="signing-secret", raw_body=raw,
+                                           profile="default", transport_key="ticket-key")
+        async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+            response = await cli.post("/v1/workflow-attempts/attempt-1/abort",
+                headers={"Authorization": "Bearer service-secret"}, json={"ticket": expired})
+            assert response.status == 200
+            assert (await response.json())["status"] == "aborted"
+
+    def test_abort_and_admission_race_is_serialized_across_connections(self, tmp_path):
+        from concurrent.futures import ThreadPoolExecutor
+        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        from gateway.platforms.api_server_runs import _workflow_fingerprint, _workflow_scope
+        path = str(tmp_path / "runs.db")
+        stores = [RunIdempotencyStore(path), RunIdempotencyStore(path)]
+        raw = b'{"input":"do work"}'
+        _, claims = self._ticket(raw)
+        registry = {k: claims[k] for k in (
+            "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
+            "payload_sha256", "transport_key")}
+        scope, fingerprint = _workflow_scope("default"), _workflow_fingerprint(claims)
+        status = {"run_id": "run_1", "status": "held"}
+        admitted = dict(registry, run_id="run_1", status="held", active=True)
+        barrier = threading.Barrier(2)
+        def post():
+            barrier.wait()
+            return stores[0].reserve_workflow("task-1", 1, scope, fingerprint, "run_1", status,
+                                              admitted, owner_pid=1, owner_started=1)
+        def abort():
+            barrier.wait()
+            return stores[1].abort_workflow(registry, scope, fingerprint)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                p, a = pool.submit(post), pool.submit(abort)
+                post_result, abort_result = p.result(), a.result()
+            assert (post_result[0], abort_result[0]) in {
+                ("created", "admitted"), ("aborted", "aborted")}
+            reopened = RunIdempotencyStore(path)
+            try:
+                receipt = reopened.workflow_registry("attempt-1")
+                if post_result[0] == "created":
+                    assert receipt["run_id"] == "run_1"
+                    assert abort_result[1]["run_id"] == "run_1"
+                else:
+                    assert receipt["run_id"] is None and receipt["abort_receipt"]
+                    assert reopened.reserve_workflow("task-1", 1, scope, fingerprint, "run_2", status,
+                        admitted, owner_pid=1, owner_started=1)[0] == "aborted"
+            finally:
+                reopened.close()
+        finally:
+            for store in stores:
+                store.close()
+
+    @pytest.mark.asyncio
+    async def test_unknown_post_never_reserves_or_starts_even_with_valid_ticket(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms.api_server_runs import _decode_ticket
+        path = tmp_path / "runs.db"
+        _use_idempotency_db(adapter, path)
+        raw = b'{"input":"do work"}'
+        ticket, claims = self._ticket(raw)
+        assert _decode_ticket(ticket, secret="signing-secret", raw_body=raw,
+                              profile="default", transport_key="ticket-key") == claims
+        with pytest.raises(ValueError):
+            _decode_ticket(ticket, secret="signing-secret", raw_body=b'{"input":"tampered"}',
+                           profile="default", transport_key="ticket-key")
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                headers = {"X-Hermes-Workflow-Ticket": ticket, "Idempotency-Key": "ticket-key",
+                           "Authorization": "Bearer service-secret"}
+                for _ in range(2):
+                    response = await cli.post("/v1/runs", data=raw, headers=headers)
+                    assert response.status == 503
+                    assert (await response.json())["error"]["code"] == "workflow_admission_unavailable"
+                create.assert_not_called()
+                registry = await cli.get("/v1/workflow-attempts/attempt-1",
+                                         headers={"Authorization": "Bearer service-secret"})
+                assert registry.status == 404
+        with sqlite3.connect(path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM workflow_run_binding").fetchone()[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_capability_hold_bind_release_and_terminal_registry(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms import api_server_runs
+        path = tmp_path / "runs.db"
+        _use_idempotency_db(adapter, path)
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        capability = False
+        released = asyncio.Event()
+        async def capable(url, token):
+            assert url == "http://slc.invalid" and token == "verify-secret"
+            return capability
+        async def wait(claims, run_id, url, token, stopped):
+            await released.wait()
+            return not stopped()
+        monkeypatch.setattr(api_server_runs, "_workflow_capable", capable)
+        monkeypatch.setattr(api_server_runs, "_wait_for_workflow_release", wait)
+        raw = b'{"input":"do work"}'
+        ticket, claims = self._ticket(raw)
+        headers = {"X-Hermes-Workflow-Ticket": ticket, "Idempotency-Key": "ticket-key",
+                   "Authorization": "Bearer service-secret"}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                rejected = await cli.post("/v1/runs", data=raw, headers=headers)
+                assert rejected.status == 503
+                assert adapter._run_idempotency_store.workflow_registry("attempt-1") is None
+                capability = True
+                first = await cli.post("/v1/runs", data=raw, headers=headers)
+                assert first.status == 202
+                first_body = await first.json()
+                assert first_body["status"] == "held"
+                run_id = first_body["run_id"]
+                replay = await cli.post("/v1/runs", data=raw, headers=headers)
+                assert (await replay.json())["run_id"] == run_id
+                assert replay.headers["Idempotency-Replayed"] == "true"
+                renewed, _ = self._ticket(raw)
+                renewed_resp = await cli.post("/v1/runs", data=raw, headers={
+                    **headers, "X-Hermes-Workflow-Ticket": renewed})
+                assert (await renewed_resp.json())["run_id"] == run_id
+                registry = await cli.get("/v1/workflow-attempts/attempt-1",
+                                         headers={"Authorization": "Bearer service-secret"})
+                held = await registry.json()
+                assert registry.status == 200
+                assert all(held[k] == claims[k] for k in (
+                    "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no"))
+                assert held["run_id"] == run_id and held["status"] == "held" and held["active"] is True
+                abort_response = await cli.post("/v1/workflow-attempts/attempt-1/abort",
+                    headers={"Authorization": "Bearer service-secret"}, json={"ticket": ticket})
+                assert abort_response.status == 409
+                conflict = await abort_response.json()
+                assert conflict["run_id"] == run_id and conflict["status"] == "held"
+                assert (await cli.get("/v1/workflow-attempts/attempt-1",
+                    headers={"Authorization": "Bearer service-secret"})).status == 200
+                assert adapter._run_idempotency_store.workflow_registry("attempt-1")["run_id"] == run_id
+                create.assert_not_called()
+                reopened = type(adapter._run_idempotency_store)(str(path))
+                assert reopened.workflow_registry("attempt-1") == held
+                reopened.close()
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+                create.return_value = agent
+                released.set()
+                for _ in range(100):
+                    if adapter._run_idempotency_store.workflow_registry("attempt-1")["active"] is False:
+                        break
+                    await asyncio.sleep(.01)
+                terminal = adapter._run_idempotency_store.workflow_registry("attempt-1")
+                assert terminal["status"] == "completed" and terminal["active"] is False
+                create.assert_called_once()
+                agent.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_replay_after_restart_keeps_crashed_held_binding_active(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms import api_server_runs
+        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        path = tmp_path / "runs.db"
+        _use_idempotency_db(adapter, path)
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        monkeypatch.setattr(api_server_runs, "_workflow_capable", AsyncMock(return_value=True))
+        release = asyncio.Event()
+        async def held(*args):
+            await release.wait()
+            return False
+        monkeypatch.setattr(api_server_runs, "_wait_for_workflow_release", held)
+        raw = b'{"input":"do work"}'
+        ticket, claims = self._ticket(raw)
+        headers = {"Authorization": "Bearer service-secret", "X-Hermes-Workflow-Ticket": ticket,
+                   "Idempotency-Key": "ticket-key"}
+        try:
+            async with TestClient(TestServer(_create_runs_app(adapter))) as cli:
+                admitted = await cli.post("/v1/runs", data=raw, headers=headers)
+                run_id = (await admitted.json())["run_id"]
+                reopened = RunIdempotencyStore(str(path))
+                try:
+                    assert reopened.workflow_registry("attempt-1")["active"] is True
+                    assert reopened.lookup_workflow("task-1", 1, "attempt-1",
+                        api_server_runs._workflow_scope("default"),
+                        api_server_runs._workflow_fingerprint(claims), "ticket-key")[1]["run_id"] == run_id
+                finally:
+                    reopened.close()
+                replay = await cli.post("/v1/runs", data=raw, headers=headers)
+                assert replay.status == 202
+                assert (await replay.json())["run_id"] == run_id
+                assert replay.headers["Idempotency-Replayed"] == "true"
+                # A crash cannot prove descendant cleanup: interrupted is still active.
+                store = RunIdempotencyStore(str(path))
+                try:
+                    status = store.workflow_status_for_run(api_server_runs._workflow_scope("default"), run_id)
+                    status["status"]["status"] = "interrupted"
+                    store.update_workflow_status(run_id, status["status"], active=True)
+                    assert store.workflow_registry("attempt-1")["active"] is True
+                finally:
+                    store.close()
+        finally:
+            release.set()
+            for task in list(adapter._active_run_tasks.values()):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_stop_held_run_never_starts_agent(self, adapter, tmp_path, monkeypatch):
+        from gateway.platforms import api_server_runs
+        _use_idempotency_db(adapter, tmp_path / "runs.db")
+        monkeypatch.setenv("HERMES_WORKFLOW_SERVICE_KEY", "service-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_SIGNING_SECRET", "signing-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_TOKEN", "verify-secret")
+        monkeypatch.setenv("SLC_ATTEMPT_VERIFY_URL", "http://slc.invalid")
+        monkeypatch.setattr(api_server_runs, "_workflow_capable", AsyncMock(return_value=True))
+        entered = asyncio.Event()
+        async def held(claims, run_id, url, token, stopped):
+            entered.set()
+            while not stopped():
+                await asyncio.sleep(.01)
+            return False
+        monkeypatch.setattr(api_server_runs, "_wait_for_workflow_release", held)
+        raw = b'{"input":"do work"}'
+        ticket, _ = self._ticket(raw)
+        headers = {"X-Hermes-Workflow-Ticket": ticket, "Idempotency-Key": "ticket-key",
+                   "Authorization": "Bearer service-secret"}
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                response = await cli.post("/v1/runs", data=raw, headers=headers)
+                run_id = (await response.json())["run_id"]
+                await entered.wait()
+                stopped = await cli.post(f"/v1/runs/{run_id}/stop", headers={
+                    "Authorization": "Bearer service-secret"})
+                assert stopped.status == 200
+                for _ in range(100):
+                    if adapter._run_idempotency_store.workflow_registry("attempt-1")["active"] is False:
+                        break
+                    await asyncio.sleep(.01)
+                registry = adapter._run_idempotency_store.workflow_registry("attempt-1")
+                assert registry["status"] == "cancelled" and registry["active"] is False
+                create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_verify_get_requires_exact_started_binding(self, monkeypatch):
+        from gateway.platforms.api_server_runs import _wait_for_workflow_release, _workflow_capable
+        attempts = []
+        admitted = False
+        async def capability(request):
+            assert request.headers["Authorization"] == "Bearer verify-secret"
+            return web.json_response({"admission_ready": admitted})
+        async def verify(request):
+            assert request.query["run_id"] == "run_1"
+            assert request.headers["Authorization"] == "Bearer verify-secret"
+            attempts.append(1)
+            if len(attempts) == 1:
+                return web.json_response({"admitted": True, "attempt_id": "attempt-1",
+                                          "task_id": "task-1", "assignee": "other", "profile": "default",
+                                          "run_id": "run_1", "start_event_id": "start-1"})
+            if len(attempts) == 2:
+                return web.json_response({"admitted": False}, status=409)
+            return web.json_response({"admitted": True, "attempt_id": "attempt-1",
+                                      "task_id": "task-1", "assignee": "agent-1", "profile": "default",
+                                      "run_id": "run_1", "start_event_id": "start-1"})
+        app = web.Application()
+        app.router.add_get("/internal/task-attempts/capabilities", capability)
+        app.router.add_get("/internal/task-attempts/{attempt_id}/admission", verify)
+        async with TestServer(app) as server:
+            base = str(server.make_url("/" )).rstrip("/")
+            assert not await _workflow_capable(base, "verify-secret")
+            admitted = True
+            assert await _workflow_capable(base, "verify-secret")
+            claims = {"attempt_id": "attempt-1", "task_id": "task-1", "assignee": "agent-1",
+                      "profile": "default"}
+            assert await _wait_for_workflow_release(claims, "run_1", base, "verify-secret", lambda: False)
+            assert len(attempts) == 3
+
+    def test_workflow_binding_is_durable_unique_and_fails_closed(self, tmp_path):
+        from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+        path = tmp_path / "runs.db"
+        status = {"run_id": "run_1", "status": "held"}
+        registry = {"attempt_id": "attempt-1", "task_id": "task-1", "attempt_no": 1,
+                    "assignee": "agent-1", "profile": "default", "queue_ready_event_id": "event-1",
+                    "payload_sha256": "a" * 64, "transport_key": "key", "run_id": "run_1",
+                    "status": "held", "active": True}
+        store = RunIdempotencyStore(str(path))
+        assert store.reserve_workflow("task-1", 1, "scope", "fingerprint", "run_1", status,
+                                      registry, owner_pid=123, owner_started=456)[0] == "created"
+        assert store.reserve_workflow("task-1", 1, "scope", "fingerprint", "run_2", status,
+                                      registry, owner_pid=123, owner_started=456)[0] == "reused"
+        assert store.reserve_workflow("task-1", 1, "scope", "different", "run_2", status,
+                                      registry, owner_pid=123, owner_started=456)[0] == "conflict"
+        other = dict(registry, attempt_id="attempt-2", run_id="run_2")
+        assert store.reserve_workflow("task-1", 1, "scope", "fingerprint", "run_2", status,
+                                      other, owner_pid=123, owner_started=456)[0] == "conflict"
+        assert store.lookup_workflow("task-1", 1, "attempt-2", "scope", "fingerprint")[0] == "conflict"
+        store.close()
+        reopened = RunIdempotencyStore(str(path))
+        assert reopened.workflow_registry("attempt-1") == registry
+        assert reopened.lookup_workflow("task-1", 1, "attempt-1", "scope", "fingerprint")[1]["run_id"] == "run_1"
+        reopened.close()
+        memory = RunIdempotencyStore(":memory:")
+        with pytest.raises(RuntimeError, match="durable"):
+            memory.reserve_workflow("task-1", 1, "scope", "fingerprint", "run_1", status,
+                                    registry, owner_pid=1, owner_started=1)
+        with pytest.raises(RuntimeError, match="durable"):
+            memory.abort_workflow(registry, "scope", "fingerprint")
+        memory.close()
 
 
 class TestRunIdempotency:
