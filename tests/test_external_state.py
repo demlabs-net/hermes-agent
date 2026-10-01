@@ -108,6 +108,26 @@ def test_write_conflict_restores_authoritative_cache():
     assert path.read_text() == "concurrent"
 
 
+def test_skill_lock_files_are_not_hydrated_or_persisted():
+    backend = FakeBackend()
+    backend.values[("skills", ".locks/task.lock")] = "stale process lock"
+    backend.values[("skills", "task/SKILL.md")] = "skill content"
+    state = runtime(backend)
+    root = state.get_skills_dir()
+
+    assert not (root / ".locks").exists()
+    assert (root / "task/SKILL.md").read_text() == "skill content"
+    (root / ".locks").mkdir()
+    lock = root / ".locks/task.lock"
+    lock.write_bytes(b"\xff\x00")
+    state.sync_file("skills", lock)
+    state.sync_tree("skills", root)
+
+    assert ("skills", ".locks/task.lock") not in backend.values
+    assert backend.values[("skills", "task/SKILL.md")] == "skill content"
+    assert lock.read_bytes() == b"\xff\x00"
+
+
 def test_unsafe_object_key_is_rejected():
     backend = FakeBackend()
     backend.values[("skills", "../escape")] = "bad"

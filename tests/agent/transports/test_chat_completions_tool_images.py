@@ -95,3 +95,35 @@ def test_custom_provider_defaults_to_strict_tool_content():
         supports_vision_tool_messages=profile.supports_vision_tool_messages,
     )
     assert [message["role"] for message in kwargs["messages"]] == ["tool", "user"]
+
+
+def test_tool_image_promotion_preserves_only_the_native_replay_owner():
+    from copy import deepcopy
+    from providers.base import ProviderProfile
+
+    owner = ProviderProfile(name="native-owner", base_url="process://native-owner")
+    owner.native_reasoning_details_type = "native-owner.native_assistant"
+    carrier = {"type": owner.native_reasoning_details_type, "messages": [{"text": "private"}]}
+    messages = [
+        {
+            "role": "assistant", "content": "",
+            "reasoning_details": [carrier],
+            "tool_calls": [{"id": "a", "type": "function", "function": {
+                "name": "vision_analyze", "arguments": "{}",
+            }}],
+        },
+        _tool_image("a", "native local image"),
+    ]
+    original = deepcopy(messages)
+    for profile in (owner, ProviderProfile(name="other"), owner):
+        wire = ChatCompletionsTransport().build_kwargs(
+            model="test-model", messages=messages, provider_profile=profile,
+            base_url=profile.base_url, supports_vision_tool_messages=False,
+        )["messages"]
+        assert [m["role"] for m in wire] == ["assistant", "tool", "user"]
+        assert wire[-1]["content"][-1] == messages[-1]["content"][-1]
+        if profile is owner:
+            assert wire[0]["reasoning_details"] == [carrier]
+        else:
+            assert "reasoning_details" not in wire[0]
+        assert messages == original

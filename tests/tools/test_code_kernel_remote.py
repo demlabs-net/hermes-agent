@@ -282,11 +282,14 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             worker.start()
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
+                # The registry lock protects the worker's concurrent insertion.
                 with _REGISTRY.lock:
                     if any(k.attached for k in _REMOTE_KERNELS.values()):
                         break
-                time.sleep(0.001)
+                time.sleep(0.005)
             else:
+                gate.set()
+                worker.join(10)
                 self.fail("remote kernel never entered its attached state")
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
             _run(env, task="settled")

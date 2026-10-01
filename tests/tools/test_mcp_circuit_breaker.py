@@ -574,20 +574,12 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
     asyncio.run(_scenario())
 
 
-# ---------------------------------------------------------------------------
-# Application-level tool errors must NOT trip the breaker
-#
-# Incident 15.09.2026 (sales roy1): the contactor reconstructed an SLC task_id from the Russian
-# task NAME, producing Cyrillic/Latin homoglyphs. slc-mcp was healthy the whole time and
-# correctly answered ``isError: true`` / "document not found" — but three consecutive such
-# answers opened the breaker, after which EVERY slc tool was blocked for the cooldown,
-# including the quarantine write the run needed. An application-level answer is a completed
-# transport round-trip and is not evidence of an unreachable server.
-# ---------------------------------------------------------------------------
-
-
-def test_application_error_does_not_open_breaker(monkeypatch, tmp_path):
-    """Repeated ``isError`` answers from a healthy server must never mark it unreachable."""
+@pytest.mark.parametrize("message", [
+    "Не найдено (get_task): document not found: demlabs_190_konveyер_partii_5",
+    "DNS lookup failed for https://nope.invalid",
+])
+def test_application_error_does_not_open_breaker(monkeypatch, tmp_path, message):
+    """A server's business error (even about its own downstream transport) is a completed RPC."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -600,7 +592,7 @@ def test_application_error_does_not_open_breaker(monkeypatch, tmp_path):
         result = MagicMock()
         result.is_error = True
         block = MagicMock()
-        block.text = "Не найдено (get_task): document not found: demlabs_190_konveyер_partii_5"
+        block.text = message
         result.content = [block]
         result.structured_content = None
         return result
@@ -615,7 +607,7 @@ def test_application_error_does_not_open_breaker(monkeypatch, tmp_path):
             parsed = json.loads(handler({}))
             # The model still sees the business error — it must act on it, not be told the
             # server is down.
-            assert "document not found" in parsed["error"], parsed
+            assert message in parsed["error"], parsed
             assert "unreachable" not in parsed["error"].lower(), (
                 f"call {i + 1} was short-circuited as server-unreachable: {parsed}")
         assert call_count["n"] == attempts, (

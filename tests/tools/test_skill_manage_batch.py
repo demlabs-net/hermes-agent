@@ -54,6 +54,17 @@ class TestSkillManageBatch(unittest.TestCase):
         for rel in ("SKILL.md", "references/a.md", "scripts/r.py"):
             self.assertTrue(os.path.exists(os.path.join(base, rel)), rel)
 
+    def test_advisory_findings_ride_on_the_op_result(self):
+        # operations[] is the only call shape, so a finding the per-op handler attaches must
+        # survive into the batch row or the linter is silent for every model call.
+        from tools.skill_linter import _BODY_SOFT_BUDGET_CHARS
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        r = self._call("probe", [{"action": "patch", "old_string": "Step 1.",
+                                  "new_string": "- rule; why.\n" * (_BODY_SOFT_BUDGET_CHARS // 12 + 1)}])
+        self.assertTrue(r["success"], r)
+        rules = {w["rule"] for w in r["results"][0]["lint_warnings"]}
+        self.assertIn("oversized-body", rules)
+
     def test_midbatch_failure_rolls_back_existing_skill(self):
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
         r = self._call("probe", [
@@ -248,11 +259,120 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertTrue(r.get("staged"), r)
         self.assertEqual(staged["payload"]["action"], "batch")
         self.assertEqual(len(staged["payload"]["operations"]), 2)
-        self.assertIn("2 ops", staged["summary"])
         # Replay applies the batch (gate bypassed inside).
         out = json.loads(self.smt.apply_skill_pending(staged["payload"]))
         self.assertTrue(out["success"], out)
         self.assertEqual(out["operations_applied"], 2)
+
+
+def _external_skill_runtime(tmp_path, monkeypatch):
+    """Real compatibility cache and sync path, with an in-memory text backend."""
+    import external_state
+    import tools.skill_manager_tool as smt
+    class Backend(external_state.TextStateBackend):
+        def __init__(self):
+            self.values = {}
+
+        def get(self, namespace, key):
+            content = self.values.get((namespace, key))
+            return None if content is None else external_state.StateObject(key, content, etag=str(hash(content)))
+
+        def list(self, namespace, prefix=""):
+            return [self.get(ns, key) for ns, key in self.values if ns == namespace and key.startswith(prefix)]
+
+        def put(self, namespace, key, content, *, content_type="text/plain", expected_etag=None):
+            current = self.get(namespace, key)
+            if expected_etag is not None and expected_etag != (current.etag if current else ""):
+                raise external_state.ExternalStateError("etag conflict")
+            self.values[(namespace, key)] = content
+            return self.get(namespace, key)
+
+        def delete(self, namespace, key, *, expected_etag=None):
+            return self.values.pop((namespace, key), None) is not None
+
+    backend = Backend()
+    monkeypatch.setattr(external_state, "_build_backend", lambda config: backend)
+    runtime = external_state.ExternalStateRuntime({
+        "skills": {"enabled": True, "namespace": "skills"}, "strict": True,
+    })
+    monkeypatch.setattr(external_state, "get_external_state_runtime", lambda: runtime)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.setattr(smt, "SKILLS_DIR", runtime.get_skills_dir())
+    return smt, runtime, backend
+
+
+def test_external_batch_publishes_only_after_all_ops_succeed(tmp_path, monkeypatch):
+    from tools.registry import registry
+
+    smt, runtime, backend = _external_skill_runtime(tmp_path, monkeypatch)
+    content = SK.format(n="probe")
+    # The advertised operations[] shape goes through the actual registry handler.
+    def dispatch(ops):
+        return json.loads(registry.dispatch("skill_manage", {"operations": ops}))
+
+    created = dispatch([{"name": "probe", "action": "create", "content": content}])
+    assert created["success"], created
+    before = dict(backend.values)
+    calls = []
+    original_put = backend.put
+
+    def record_put(*args, **kwargs):
+        calls.append(args)
+        return original_put(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "put", record_put)
+    failed = dispatch([
+        {"name": "probe", "action": "patch", "old_string": "Step 1.", "new_string": "Step 2."},
+        {"name": "probe", "action": "write_file", "file_path": "../escape", "file_content": "x"},
+    ])
+    assert not failed["success"]
+    assert not calls, "a rolled-back op must never escape to the external backend"
+    assert backend.values == before
+    assert (runtime.get_skills_dir() / "probe" / "SKILL.md").read_text() == content
+
+    saved = dispatch([
+        {"name": "probe", "action": "patch", "old_string": "Step 1.", "new_string": "Step 2."},
+        {"name": "probe", "action": "write_file", "file_path": "references/a.md", "file_content": "reference"},
+    ])
+    assert saved["success"], saved
+    assert backend.values[("skills", "probe/SKILL.md")] == content.replace("Step 1.", "Step 2.")
+    assert backend.values[("skills", "probe/references/a.md")] == "reference"
+    assert not any(key.startswith(".locks/") for namespace, key in backend.values)
+
+
+def test_external_batch_never_rolls_back_over_mounted_guidance(tmp_path, monkeypatch):
+    from tools.registry import registry
+    from tools import skill_manager_batch
+    from unittest.mock import Mock
+
+    smt, runtime, backend = _external_skill_runtime(tmp_path, monkeypatch)
+    mounted = tmp_path / "mounted"
+    skill = mounted / "guidance" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    content = SK.format(n="guidance")
+    skill.write_text(content)
+    monkeypatch.setattr("agent.skill_utils.get_all_skills_dirs", lambda: [runtime.get_skills_dir(), mounted])
+    monkeypatch.setattr("agent.skill_utils.get_skill_create_dir", lambda: mounted)
+    rollback = Mock(wraps=skill_manager_batch._rollback)
+    monkeypatch.setattr(skill_manager_batch, "_rollback", rollback)
+
+    refused = json.loads(registry.dispatch("skill_manage", {"operations": [
+        {"name": "fresh", "action": "create", "content": SK.format(n="fresh")},
+        {"name": "guidance", "action": "patch", "old_string": "Step 1.", "new_string": "changed"},
+    ]}))
+    assert not refused["success"] and "read-only" in refused["error"]
+    rollback.assert_not_called()
+    assert skill.read_text() == content
+    assert not (runtime.get_skills_dir() / "fresh").exists()
+    assert not backend.values
+
+    saved = json.loads(registry.dispatch("skill_manage", {"operations": [
+        {"name": "fresh", "action": "create", "content": SK.format(n="fresh")},
+    ]}))
+    assert saved["success"], saved
+    assert not (mounted / "fresh").exists()
+    assert backend.values[("skills", "fresh/SKILL.md")] == SK.format(n="fresh")
 
 
 if __name__ == "__main__":

@@ -499,15 +499,55 @@ def test_operator_cli_extra_prompt_digest_matches_module():
         assert module._extra_prompt_digest(text) == operator_hold.extra_prompt_digest(text)
 
 
-def test_provider_dispatch_does_not_invoke_client_after_rotation(tmp_path):
+@pytest.mark.parametrize("rotate_during_setup", [False, True])
+def test_provider_dispatch_does_not_invoke_client_after_rotation(tmp_path, rotate_during_setup):
     from agent.chat_completion_helpers import _dispatch_nonstreaming_api_request
     from types import SimpleNamespace
-    called = []
-    with operator_hold.run_scope():
+    from unittest.mock import Mock
+
+    create = Mock()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    setup_calls = []
+
+    def make_client(*args):
+        setup_calls.append(args)
         rotate(tmp_path, "released-again")
+        return client
+
+    with operator_hold.run_scope():
+        if not rotate_during_setup:
+            rotate(tmp_path, "released-again")
         with pytest.raises(operator_hold.OperatorHoldError):
-            _dispatch_nonstreaming_api_request(SimpleNamespace(api_mode="chat_completions"), {}, make_client=lambda *a: called.append(a))
-    assert called == []
+            _dispatch_nonstreaming_api_request(
+                SimpleNamespace(api_mode="chat_completions", provider="custom"), {}, make_client=make_client,
+            )
+    assert bool(setup_calls) is rotate_during_setup
+    create.assert_not_called()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_auxiliary_progress_fallback_cannot_dispatch_after_rotation(monkeypatch, tmp_path, async_mode):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+    from agent import auxiliary_client as aux
+
+    def reject_stream(**kwargs):
+        assert kwargs["stream"] is True
+        rotate(tmp_path, "released-again")
+        raise ValueError("streaming is unsupported")
+
+    create = AsyncMock(side_effect=reject_stream) if async_mode else Mock(side_effect=reject_stream)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr(aux, "_relay_auxiliary_metadata", lambda **kwargs: None)
+    kwargs = {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+    with operator_hold.run_scope(), aux.aux_progress_hook(lambda: None):
+        with pytest.raises(operator_hold.OperatorHoldError):
+            if async_mode:
+                asyncio.run(aux._relay_async_completion(client, kwargs))
+            else:
+                aux._relay_sync_completion(client, kwargs)
+    assert create.call_count == 1
 
 
 def test_mutable_env_cannot_downgrade_operator_policy(monkeypatch, tmp_path):

@@ -5,7 +5,7 @@ memory and skill implementations, but it becomes a process-scoped cache when
 external state is enabled.  The durable source of truth is a generic text
 object backend.  The built-in backend speaks MCP Streamable HTTP and therefore
 works with SLC or any other MCP server that implements the four ``state_*``
-tools documented in ``docs/external-state.md``.
+tools documented in ``website/docs/developer-guide/external-state.md``.
 
 No network access occurs unless ``external_state.backend`` is configured.
 Failures are strict by default: Hermes must not silently create a second,
@@ -383,6 +383,10 @@ class ExternalStateRuntime:
                 objects = self.backend.list(namespace)
                 for listed in objects:
                     relative = _safe_relative_key(listed.key)
+                    # Skill advisory locks belong to this process/filesystem,
+                    # never to the authoritative portable skill contents.
+                    if name == "skills" and relative.parts[0] == ".locks":
+                        continue
                     value = self.backend.get(namespace, listed.key)
                     if value is None:
                         continue
@@ -410,6 +414,8 @@ class ExternalStateRuntime:
     def sync_file(self, name: str, path: Path) -> None:
         root = self.get_memory_dir() if name == "memory" else self.get_skills_dir()
         relative = path.resolve().relative_to(root.resolve()).as_posix()
+        if name == "skills" and PurePosixPath(relative).parts[0] == ".locks":
+            return
         namespace = self.namespace(name)
         content = path.read_text(encoding="utf-8")
         current = self._etags.get((namespace, relative), "")
@@ -448,6 +454,8 @@ class ExternalStateRuntime:
         for path in sorted(root.rglob("*")):
             if path.is_file() and not path.is_symlink():
                 relative = path.resolve().relative_to(authoritative_root.resolve()).as_posix()
+                if name == "skills" and PurePosixPath(relative).parts[0] == ".locks":
+                    continue
                 local_keys.add(relative)
                 self.sync_file(name, path)
         prefix = root.resolve().relative_to(authoritative_root.resolve()).as_posix()
