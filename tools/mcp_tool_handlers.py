@@ -265,6 +265,14 @@ def _acquire_call_server(server_name: str, tool_timeout: float):
 _MCP_APPLICATION_ERROR_KEY = "_mcp_application_error"
 
 
+def _result_is_error(result) -> bool:
+    """True only for a JSON payload carrying an ``error`` key (non-JSON = success)."""
+    try:
+        return "error" in json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+
+
 def _result_is_transport_failure(result) -> bool:
     """True only for an error payload that is NOT an application-level tool answer.
 
