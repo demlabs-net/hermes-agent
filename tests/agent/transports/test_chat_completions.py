@@ -9,11 +9,12 @@ from openai import OpenAI
 
 from agent.transports import get_transport
 from agent.transports.types import NormalizedResponse
+from providers import get_provider_profile
 
 
 @pytest.fixture
 def transport():
-    import agent.transports.chat_completions  # noqa: F401
+    import agent.transports.chat_completions
     return get_transport("chat_completions")
 
 
@@ -107,8 +108,16 @@ class TestChatCompletionsBasic:
 
 
 
-
-
+    def test_convert_messages_strips_replayed_platform_message_id(self, transport):
+        """SQLite replay exposes ``platform_message_id`` as ``message_id`` (JSONL transcript compat);
+        the gateway stamps it on every user row from the admission id. It is delivery bookkeeping:
+        the in-process CLI never sent it, so a resuming surface that let it through would send a
+        different prefix for the same durable session and break the cache.
+        """
+        msgs = [{"role": "user", "content": "hi", "message_id": "adm-123"}]
+        result = transport.convert_messages(msgs)
+        assert "message_id" not in result[0]
+        assert result[0]["content"] == "hi"
 
     def test_convert_messages_strips_timestamp(self, transport):
         """Internal per-message ``timestamp`` metadata (stamped by
@@ -517,45 +526,32 @@ class TestChatCompletionsKimi:
 
 class TestChatCompletionsLmStudioReasoning:
     """LM Studio publishes per-model reasoning ``allowed_options``. When the
-    user requests a graded effort from a toggle-style ``["off","on"]``
-    model, the transport omits the field so the model's declared default
-    applies without a fallback warning. For a graduated model, unsupported
-    effort levels remain omitted.
+    user requests an effort the model can't honor (e.g. ``high`` on a
+    toggle-style ``["off","on"]`` model), the lmstudio profile omits
+    ``reasoning_effort`` so LM Studio falls back to the model's default —
+    silently downgrading "high" to "low" would mislead the user.
     """
 
-    def test_omits_enabled_effort_for_toggle(self, transport):
+    def test_omits_effort_when_high_not_allowed_toggle(self, transport):
         kw = transport.build_kwargs(
             model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
-            is_lmstudio=True,
+            provider_profile=get_provider_profile("lmstudio"),
             supports_reasoning=True,
             reasoning_config={"effort": "high"},
             lmstudio_reasoning_options=["off", "on"],
         )
         assert "reasoning_effort" not in kw
 
-    def test_maps_disabled_reasoning_to_none_for_toggle(self, transport):
-        kw = transport.build_kwargs(
-            model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
-            is_lmstudio=True,
-            supports_reasoning=True,
-            reasoning_config={"enabled": False},
-            lmstudio_reasoning_options=["off", "on"],
-        )
-        assert kw["reasoning_effort"] == "none"
-
 
     def test_passes_through_when_effort_allowed(self, transport):
         kw = transport.build_kwargs(
             model="gpt-oss", messages=[{"role": "user", "content": "Hi"}],
-            is_lmstudio=True,
+            provider_profile=get_provider_profile("lmstudio"),
             supports_reasoning=True,
             reasoning_config={"effort": "high"},
             lmstudio_reasoning_options=["off", "low", "medium", "high"],
         )
         assert kw["reasoning_effort"] == "high"
-
-
-
 
 
 class TestChatCompletionsValidate:

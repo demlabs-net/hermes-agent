@@ -9,7 +9,6 @@ from typing import Any
 
 from gateway.disk_status import collect_disk_status
 from hermes_constants import get_hermes_home
-from utils import load_yaml_file_readonly
 
 
 _CONNECTED_STATES = {"connected", "running", "ok"}
@@ -49,11 +48,15 @@ def _probe_state_db(home: Path) -> dict[str, Any]:
 
 
 def _probe_config(home: Path) -> dict[str, Any]:
+    from hermes_cli.config_backend import ConfigBackendUnavailable, config_exists, read_config_doc_readonly
     path = home / "config.yaml"
-    if not path.exists():
-        return _check("ok", "using defaults")
     try:
-        raw = load_yaml_file_readonly(path)
+        if not config_exists(path):
+            return _check("ok", "using defaults")
+        raw = read_config_doc_readonly(path)
+    except ConfigBackendUnavailable:
+        # A SystemExit on purpose (readers must not serve defaults); this probe exists to report it.
+        return _check("degraded", "config backend unavailable")
     except Exception as exc:
         return _check("degraded", f"invalid config ({type(exc).__name__})")
     return _check("ok") if raw is None or isinstance(raw, dict) else _check("degraded", "top level is not a mapping")

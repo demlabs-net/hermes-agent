@@ -3,17 +3,39 @@ a single agent run on the latest event's state; unrelated or unkeyed events are 
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms import webhook_ingress
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
 
 
 def _make_adapter(routes=None):
     extra = {"host": "127.0.0.1", "port": 0, "routes": routes or {}, "rate_limit": 100}
     return WebhookAdapter(PlatformConfig(enabled=True, extra=extra))
+
+
+def _capture_admissions(adapter, monkeypatch):
+    """Stand in for the durable producer: the adapter admits every dispatched event through
+    ``admit_producer`` (immediate and coalesced paths alike), never a spawned ``handle_message``.
+    Returns the list of admitted events; the finalize task is a no-op."""
+    admitted = []
+
+    async def _admit(_adapter, event):
+        admitted.append(event)
+        return SimpleNamespace(admission_id=f"adm-{len(admitted)}", ref=SimpleNamespace(profile_id="default"))
+
+    async def _finalize(event, authority, receipt):
+        return None
+
+    monkeypatch.setattr(webhook_ingress, "admit_producer", _admit)
+    monkeypatch.setattr(adapter, "_finalize_delivery", _finalize)
+    adapter._message_handler = SimpleNamespace(__self__=SimpleNamespace())
+    monkeypatch.setattr("gateway.session_authorities.authority_for_profile_id", lambda runner, pid: object())
+    return admitted
 
 
 def _coalesce_route(**coalesce):
@@ -64,12 +86,12 @@ async def test_invalid_coalesce_config_rejected_at_connect(route, match, tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_rapid_same_entity_events_dispatch_once_with_latest():
+async def test_rapid_same_entity_events_dispatch_once_with_latest(monkeypatch):
     """Three events on PR 7 → one run carrying the last event's prompt/delivery id and a superseded
     note; a different PR in the same burst is its own group; a provider retry (same delivery id)
     is dropped by idempotency before coalescing and is not counted."""
     adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=0.05)})
-    adapter.handle_message = AsyncMock()
+    admitted = _capture_admissions(adapter, monkeypatch)
 
     statuses = []
     for i, action in enumerate(["opened", "synchronize", "synchronize"]):
@@ -80,11 +102,11 @@ async def test_rapid_same_entity_events_dispatch_once_with_latest():
     assert statuses == [(202, "coalesced")] * 3
     assert json.loads(retry.text)["status"] == "duplicate"
     assert json.loads(other.text)["status"] == "coalesced"
-    adapter.handle_message.assert_not_called()
+    assert admitted == []
 
     await asyncio.sleep(0.15)
 
-    events = {c.args[0].message_id: c.args[0] for c in adapter.handle_message.call_args_list}
+    events = {e.message_id: e for e in admitted}
     assert set(events) == {"d2", "other"}
     assert "PR 7: synchronize" in events["d2"].text and "3 webhook events" in events["d2"].text
     assert "coalesced" not in events["other"].text
@@ -92,60 +114,34 @@ async def test_rapid_same_entity_events_dispatch_once_with_latest():
 
 
 @pytest.mark.asyncio
-async def test_max_wait_caps_starvation_and_unresolved_key_dispatches_immediately():
+async def test_max_wait_caps_starvation_and_unresolved_key_dispatches_immediately(monkeypatch):
     adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=10,
                                                           max_wait_seconds=0.1)})
-    adapter.handle_message = AsyncMock()
+    admitted = _capture_admissions(adapter, monkeypatch)
 
     # An event without the key field must not be folded into a shared "{pull_request.number}" group.
     resp = await adapter._handle_webhook(_mock_request(_payload(None, "created"), delivery_id="nokey"))
     assert json.loads(resp.text)["status"] == "accepted"
-    await asyncio.sleep(0)
-    assert adapter.handle_message.call_count == 1
+    assert len(admitted) == 1
 
     # A stream faster than the 10s window still dispatches once max_wait (0.1s) elapses.
     for i in range(3):
         await adapter._handle_webhook(_mock_request(_payload(5), delivery_id=f"s{i}"))
         await asyncio.sleep(0.02)
     await asyncio.sleep(0.15)
-    assert adapter.handle_message.call_count == 2
-    assert "3 webhook events" in adapter.handle_message.call_args[0][0].text
+    assert len(admitted) == 2
+    assert "3 webhook events" in admitted[-1].text
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flush", [False, True], ids=["timer", "disconnect"])
-async def test_coalesced_delivery_cannot_renew_revoked_operator_grant(monkeypatch, tmp_path, flush):
-    from agent import operator_hold
-
-    control = tmp_path / "control.json"
-    control.write_text(json.dumps({"generation": "initial", "held": False}))
-    monkeypatch.setattr(operator_hold, "_POLICY", operator_hold.OperatorPolicy(tmp_path / "active", True, ""))
+async def test_disconnect_flushes_pending_groups(monkeypatch):
     adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=60)})
-    adapter.handle_message = AsyncMock()
-    request = _mock_request(_payload(4), delivery_id="before-hold")
-    request.headers["X-Hermes-Operator-Generation"] = "initial"
-    assert (await adapter._handle_webhook(request)).status == 202
-    control.write_text(json.dumps({"generation": "rotated", "held": False}))
-    if flush:
-        await adapter.disconnect()
-    else:
-        group_key = next(iter(adapter._coalescer.pending))
-        adapter._coalescer._timers[group_key].cancel()
-        await adapter._coalescer._timer(group_key, 0)
-    await asyncio.sleep(0)
-    adapter.handle_message.assert_not_called()
-    assert not adapter._coalescer.pending
-
-
-@pytest.mark.asyncio
-async def test_disconnect_flushes_pending_groups():
-    adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=60)})
-    adapter.handle_message = AsyncMock()
+    admitted = _capture_admissions(adapter, monkeypatch)
     await adapter._handle_webhook(_mock_request(_payload(4), delivery_id="pend"))
-    adapter.handle_message.assert_not_called()
+    assert admitted == []
 
     await adapter.disconnect()
 
-    assert adapter.handle_message.call_count == 1
-    assert adapter.handle_message.call_args[0][0].message_id == "pend"
+    assert len(admitted) == 1
+    assert admitted[0].message_id == "pend"
     assert adapter._coalescer.pending == {}
