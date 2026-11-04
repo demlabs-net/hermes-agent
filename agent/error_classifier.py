@@ -281,6 +281,9 @@ CODEX_ACCOUNT_MODEL_ENTITLEMENT_MARKER = "model is not supported when using code
 _MODEL_NOT_FOUND_PATTERNS = (
     "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
     "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
+    # Local inference balancer 404 when no live backend serves the requested model (its
+    # flash-next engine can be mid-restart): the configured fallback model is the right move.
+    "no backend serves model",
     # Nous 404 when the provider retires a :free route — the slug is dead for every
     # credential, so fall back instead of burning retries (#123180). Unlike the free-tier
     # billing wording, the account's balance/tier is not what rejected the call.
