@@ -1,17 +1,16 @@
 """Durable ``/v1/runs`` admission, status, events, and control handlers."""
 
 import asyncio
-import base64
-import binascii
+import contextvars
+import functools
 import hashlib
-import hmac
 import json
 import logging
 import os
 import threading
 import time
 import uuid
-from urllib.parse import quote
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -28,16 +27,11 @@ except ImportError:
     RequestKey = None  # type: ignore[assignment,misc]
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
+from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
-_TICKET_FIELDS = (
-    "v", "aud", "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
-    "payload_sha256", "transport_key", "attempt_no", "issued_at", "expires_at")
-_WORKFLOW_TICKET_HEADER = "X-Hermes-Workflow-Ticket"
-# A stop is a request, not proof that a cooperative turn has exited.
-_RUN_STOP_ENTRY_WAIT_SECONDS = 1.0
 
 # Executor-thread lifetime for API-server agent turns (#116535). The handler-side
 # ``_inflight_agent_runs`` count in api_server.py drops in the handler's ``finally`` when the
@@ -47,6 +41,40 @@ _RUN_STOP_ENTRY_WAIT_SECONDS = 1.0
 # in the worker thread's own ``finally``, which also keeps it visible past ``adapters.clear()``.
 _API_WORKER_LOCK = threading.Lock()
 _API_WORKER_LIVE = 0
+# API-server agent turns and cron fires run on their own executor, as Desktop and messaging turns
+# do (``GatewayRunner._get_executor``). asyncio's default pool is ``min(32, cpu_count + 4)`` threads
+# shared with every ``asyncio.to_thread`` SessionDB read in the session handlers, so once live
+# turns filled it each /api/sessions read queued behind a whole turn (#144362). Turn concurrency is
+# bounded where it is refused: ``gateway.api_server.max_concurrent_runs`` (429 past the cap).
+# Created on first use and retired at adapter disconnect (``_close_run_state``), so its parked
+# threads do not outlive the adapter that used them; the loop's default executor this replaced
+# went away with its loop the same way.
+_API_TURN_EXECUTOR: _UnboundedThreadExecutor | None = None
+_API_TURN_EXECUTOR_LOCK = threading.Lock()
+
+
+def api_turn_executor() -> _UnboundedThreadExecutor:
+    """The executor that runs API-server agent turns and cron fires (never the loop's default)."""
+    global _API_TURN_EXECUTOR
+    with _API_TURN_EXECUTOR_LOCK:
+        if _API_TURN_EXECUTOR is None:
+            _API_TURN_EXECUTOR = _UnboundedThreadExecutor(thread_name_prefix="hermes-api-turn")
+        return _API_TURN_EXECUTOR
+
+
+def retire_api_turn_executor() -> _UnboundedThreadExecutor | None:
+    """Shut the API turn executor down without waiting and return it (None if never used).
+
+    Parked workers exit now; a worker still inside a turn finishes it, releases its
+    ``api_worker_live_count`` share as before, and exits instead of parking. A later submit gets
+    a fresh executor, so another adapter still serving keeps working.
+    """
+    global _API_TURN_EXECUTOR
+    with _API_TURN_EXECUTOR_LOCK:
+        executor, _API_TURN_EXECUTOR = _API_TURN_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=False)
+    return executor
 
 
 def api_worker_live_count() -> int:
@@ -55,12 +83,18 @@ def api_worker_live_count() -> int:
         return _API_WORKER_LIVE
 
 
+async def on_turn_executor(fn, /, *args, **kwargs):
+    """``asyncio.to_thread`` (context copied the same way) on the API turn executor."""
+    call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+    return await asyncio.get_running_loop().run_in_executor(api_turn_executor(), call)
+
+
 def _submit_api_worker(loop, fn):
-    """``loop.run_in_executor(None, fn)`` with the worker-lifetime count held for the submission.
+    """``loop.run_in_executor(api_turn_executor(), fn)`` with the worker-lifetime count held for the submission.
 
     Increment on the submitting (handler) thread so the count is live before the worker can
     exit; decrement in the worker thread's own ``finally`` so handler cancellation cannot drop
-    it early. When submission itself fails (default executor already shut down during quiesce
+    it early. When submission itself fails (executor shut down, or no thread can be started
     -> RuntimeError) the worker never runs, so the count is released here instead — a leaked
     count would make the shutdown close gate skip the SessionDB close for the process lifetime.
     """
@@ -77,13 +111,11 @@ def _submit_api_worker(loop, fn):
                 _API_WORKER_LIVE -= 1
 
     try:
-        return loop.run_in_executor(None, _counted)
+        return loop.run_in_executor(api_turn_executor(), _counted)
     except BaseException:
         with _API_WORKER_LOCK:
             _API_WORKER_LIVE -= 1
         raise
-
-
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -101,10 +133,15 @@ _USAGE_FIELDS = (
     ("total_tokens", "session_total_tokens"), ("cache_read_tokens", "session_cache_read_tokens"),
     ("cache_write_tokens", "session_cache_write_tokens"))
 # Tool-progress event -> SSE payload fields (tool_name, preview, kwargs); key order is wire format.
+def _call_id(kw: dict[str, Any]) -> dict[str, Any]:
+    return {"tool_call_id": kw["tool_call_id"]} if kw.get("tool_call_id") else {}
+
+
 _FIXED_EVENT_FIELDS = {
-    "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview},
+    "tool.started": lambda tool, preview, kw: {"tool": tool, "preview": preview, **_call_id(kw)},
     "tool.completed": lambda tool, preview, kw: {
-        "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False)},
+        "tool": tool, "duration": round(kw.get("duration", 0), 3), "error": kw.get("is_error", False),
+        **_call_id(kw)},
     "reasoning.available": lambda tool, preview, kw: {"text": preview or ""}}
 _TOOL_COMPLETED_PREVIEW_MAX_CHARS = 500
 
@@ -120,15 +157,63 @@ def _tool_completed_preview(result: Any, redact_sensitive_text: Callable[..., st
     return preview if len(preview) <= limit else preview[: limit - 3] + "..."
 
 
-def _remember_room_retention(request: "web.Request", claims: dict[str, Any]) -> None:
+_RUN_STREAM_SUBSCRIBER_OVERFLOW = object()
+_RUN_STREAM_WRITE_TIMEOUT = 5.0
+
+
+class _RunStream:
+    """Sequence and retain one run's events while fanning out to SSE clients."""
+
+    BACKLOG_LIMIT = 1000
+    SUBSCRIBER_QUEUE_LIMIT = 256
+
+    def __init__(self) -> None:
+        self.subscribers: set[asyncio.Queue] = set()
+        self.backlog: deque[tuple[int, Optional[dict[str, Any]]]] = deque(
+            maxlen=self.BACKLOG_LIMIT
+        )
+        self.next_seq = 0
+        self.terminal = False
+
+    def put_nowait(self, event: Optional[dict[str, Any]]) -> None:
+        if self.terminal:
+            return
+        seq = self.next_seq
+        self.next_seq += 1
+        self.backlog.append((seq, event))
+        if event is None:
+            self.terminal = True
+        for queue in list(self.subscribers):
+            try:
+                queue.put_nowait((seq, event))
+            except asyncio.QueueFull:
+                self.detach(queue)
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait((seq, _RUN_STREAM_SUBSCRIBER_OVERFLOW))
+
+    def attach(
+        self, last_seq: int = -1
+    ) -> tuple[asyncio.Queue, list[tuple[int, Optional[dict[str, Any]]]]]:
+        replay = [(seq, event) for seq, event in self.backlog if seq > last_seq]
+        # Headroom for events produced while the replay is still being written.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=self.SUBSCRIBER_QUEUE_LIMIT + len(replay))
+        self.subscribers.add(queue)
+        return queue, replay
+
+    def detach(self, queue: asyncio.Queue) -> None:
+        self.subscribers.discard(queue)
+
+
+def _remember_room_retention(request: web.Request, claims: dict[str, Any]) -> None:
     value = float(claims.get("status_expires_at") or claims.get("expires_at") or 0)
     try:
         request[_ROOM_RETENTION_REQUEST_KEY] = value
     except (AttributeError, TypeError):
-        setattr(request, "_hermes_room_run_retention_until", value)
+        request._hermes_room_run_retention_until = value
 
 
-def _room_retention_until(request: "web.Request") -> float:
+def _room_retention_until(request: web.Request) -> float:
     try:
         value = request.get(_ROOM_RETENTION_REQUEST_KEY, 0)
     except AttributeError:
@@ -136,57 +221,12 @@ def _room_retention_until(request: "web.Request") -> float:
     return max(0.0, float(value or 0))
 
 
-def _decode_ticket(ticket: str, *, secret: str, raw_body: bytes | None, profile: str,
-                   transport_key: str | None, allow_expired: bool = False) -> dict[str, Any]:
-    """Verify SLC's signed READY ticket without reserializing its signed bytes."""
-    if not isinstance(ticket, str) or len(ticket) > 8192 or ticket.count(".") != 1 or not secret:
-        raise ValueError("Invalid workflow ticket")
-    encoded, signature = ticket.split(".")
-    try:
-        def decode(segment):
-            if not segment or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-                                  for c in segment):
-                raise ValueError("Invalid base64url ticket")
-            return base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4))
-        raw_signature = decode(signature)
-        signed = ("slc-attempt-v1." + encoded).encode("ascii")
-        expected = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).digest()
-        if len(raw_signature) != 32 or not hmac.compare_digest(raw_signature, expected):
-            raise ValueError("Invalid workflow signature")
-        raw = decode(encoded)
-        claims = json.loads(raw)
-        if not isinstance(claims, dict) or tuple(claims) != _TICKET_FIELDS:
-            raise ValueError("Invalid workflow fields")
-        if type(claims["v"]) is not int or claims["v"] != 1 or claims["aud"] != "Hermes workflow":
-            raise ValueError("Invalid workflow audience")
-        for key in ("attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
-                    "payload_sha256", "transport_key"):
-            if not isinstance(claims[key], str) or not claims[key] or len(claims[key]) > 512:
-                raise ValueError("Invalid workflow identity")
-        if type(claims["attempt_no"]) is not int or claims["attempt_no"] < 1:
-            raise ValueError("Invalid workflow attempt")
-        issued, expires = claims["issued_at"], claims["expires_at"]
-        if (type(issued) not in (int, float) or type(expires) not in (int, float)
-                or issued > time.time() or (not allow_expired and time.time() >= expires)
-                or expires <= issued or expires - issued > 86400):
-            raise ValueError("Expired workflow ticket")
-        digest = claims["payload_sha256"]
-        if (len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)
-                or claims["profile"] != profile
-                or (transport_key is not None and claims["transport_key"] != transport_key)
-                or (raw_body is not None and not hmac.compare_digest(digest, hashlib.sha256(raw_body).hexdigest()))):
-            raise ValueError("Workflow request binding mismatch")
-        return claims
-    except (UnicodeError, TypeError, KeyError, OverflowError, binascii.Error, json.JSONDecodeError) as exc:
-        raise ValueError("Invalid workflow ticket") from exc
-
-
-def _run_event(run_id: str, name: str, **fields: Any) -> Dict[str, Any]:
+def _run_event(run_id: str, name: str, **fields: Any) -> dict[str, Any]:
     """Build one SSE event payload (key order is part of the wire format)."""
     return {"event": name, "run_id": run_id, "timestamp": time.time(), **fields}
 
 
-def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+def terminal_run_status(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Map a ``run_conversation`` result to its terminal run status and the wire fields every
     terminal event/status carries. An interrupted turn is ``cancelled``; a turn that ended
     without finishing (``failed``, ``partial``, or ``completed=False`` such as the iteration
@@ -197,7 +237,7 @@ def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         and result.get("completed") is not False
     )
     status = "cancelled" if interrupted else "completed" if finished else "failed"
-    fields: Dict[str, Any] = {
+    fields: dict[str, Any] = {
         "completed": finished, "partial": bool(result.get("partial")), "interrupted": interrupted,
     }
     if not finished and result.get("turn_exit_reason"):
@@ -208,126 +248,11 @@ def terminal_run_status(result: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
     return status, fields
 
 
-def _run_not_found(_openai_error, run_id: str) -> "web.Response":
+def _run_not_found(_openai_error, run_id: str) -> web.Response:
     return _json_error(_openai_error, f"Run not found: {run_id}", code="run_not_found", status=404)
 
 
-def _check_workflow_service_auth(self, request: "web.Request") -> "web.Response | None":
-    """Workflow dispatch uses an independent service credential, never the UI API key."""
-    from gateway.platforms._shared import get_scoped_secret
-    expected = get_scoped_secret("HERMES_WORKFLOW_SERVICE_KEY", "")
-    if not expected:
-        return web.json_response({"error": "Workflow service authentication unavailable"}, status=503)
-    authorization = request.headers.get("Authorization", "")
-    if not authorization.startswith("Bearer ") or not hmac.compare_digest(
-        authorization[7:].strip().encode(), expected.encode()
-    ):
-        return web.json_response({"error": "Invalid workflow service authentication"}, status=401)
-    return None
-
-
-def _workflow_config(self) -> tuple[str, str, str, str]:
-    """A workflow is never admitted unless both sides of the release gate are configured."""
-    from gateway.platforms._shared import get_scoped_secret
-    return (get_scoped_secret("SLC_ATTEMPT_SIGNING_SECRET", ""),
-            get_scoped_secret("HERMES_WORKFLOW_SERVICE_KEY", ""),
-            self._workflow_slc_url or get_scoped_secret("SLC_ATTEMPT_VERIFY_URL", ""),
-            get_scoped_secret("SLC_ATTEMPT_VERIFY_TOKEN", ""))
-
-
-def _workflow_request_profile(_api_server) -> str:
-    profile = _api_server._api_request_profile.get()
-    if profile:
-        return profile
-    from hermes_cli.profiles import get_active_profile_name
-    return get_active_profile_name()
-
-
-def _workflow_protected(self, _api_server) -> bool:
-    return _workflow_request_profile(_api_server) in self._workflow_protected_profiles
-
-
-def _workflow_locally_ready(self) -> bool:
-    """Check only Hermes' local machinery; do not depend on SLC's capability probe."""
-    from urllib.parse import urlsplit
-    try:
-        secret, service_key, url, token = _workflow_config(self)
-        parsed = urlsplit(url)
-        return bool(all((secret, service_key, token, parsed.hostname))
-                    and parsed.scheme in ("http", "https") and not (parsed.username or parsed.password
-                    or parsed.query or parsed.fragment)
-                    and self._run_idempotency_store.durable)
-    except Exception:
-        return False
-
-
-async def _handle_workflow_readiness(self, request, *, _api_server):
-    auth = _check_workflow_service_auth(self, request)
-    if auth is not None:
-        return auth
-    profile = _workflow_request_profile(_api_server)
-    protected = _workflow_protected(self, _api_server)
-    ready = protected and _workflow_locally_ready(self)
-    return web.json_response({"profile": profile, "protected": protected,
-                              "workflow_admission_enabled": ready,
-                              "generic_runs_denied": protected})
-
-
-async def _workflow_capable(url: str, token: str) -> bool:
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
-            async with session.get(url.rstrip("/") + "/internal/task-attempts/capabilities",
-                                   headers={"Authorization": "Bearer " + token}) as response:
-                return response.status == 200 and (await response.json()).get("admission_ready") is True
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError, AttributeError):
-        return False
-
-
-def _workflow_scope(profile: str) -> str:
-    return hashlib.sha256(("workflow\0" + profile).encode()).hexdigest()
-
-
-def _workflow_fingerprint(claims: dict[str, Any]) -> str:
-    # Ticket renewal may move the signed timestamps without changing the
-    # attempt or payload. Identity and transport binding must remain fixed.
-    binding = {key: claims[key] for key in (
-        "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id",
-        "payload_sha256", "transport_key", "attempt_no")}
-    return hashlib.sha256(json.dumps(binding, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _workflow_expected(claims: dict[str, Any], run_id: str) -> dict[str, Any]:
-    return {key: claims[key] for key in (
-        "attempt_id", "task_id", "assignee", "profile")} | {"run_id": run_id, "admitted": True}
-
-
-async def _wait_for_workflow_release(claims: dict[str, Any], run_id: str, url: str, token: str,
-                                     stopped: Callable[[], bool]) -> bool:
-    """Read-only SLC verification; all transport and identity failures leave the run held."""
-    import aiohttp
-    endpoint = (url.rstrip("/") + "/internal/task-attempts/" + quote(claims["attempt_id"], safe="")
-                + "/admission?run_id=" + quote(run_id, safe=""))
-    timeout = aiohttp.ClientTimeout(total=3)
-    deadline = time.monotonic() + 1800  # bounded inactivity; never interpret an error as release
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        while not stopped() and time.monotonic() < deadline:
-            try:
-                async with session.get(endpoint, headers={"Authorization": "Bearer " + token}) as response:
-                    if response.status == 200:
-                        body = await response.json()
-                        expected = _workflow_expected(claims, run_id)
-                        if (isinstance(body, dict) and all(type(body.get(k)) is type(v) and body[k] == v
-                                                          for k, v in expected.items())
-                                and isinstance(body.get("start_event_id"), str) and body["start_event_id"]):
-                            return True
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
-                pass
-            await asyncio.sleep(0.5)
-    return False
-
-
-def _uses_room_run_auth(self, request: "web.Request") -> bool:
+def _uses_room_run_auth(self, request: web.Request) -> bool:
     return request.path.endswith("/v1/runs") and bool(self._room_grant_token(request))
 
 
@@ -340,21 +265,16 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owner_started = int(get_process_start_time(self._run_owner_pid) or 0)
     except Exception:
         self._run_owner_started = 0
-    # All keyed by run_id: SSE queues (+creation time for the TTL sweep), connected
-    # subscribers, live agent/task refs for cooperative stop (the executor thread may
-    # outlive the request, hence the separate stopping set), pollable statuses, and
-    # approval session keys (approval core resolves by session key, clients by run_id).
+    # All keyed by run_id: SSE fanout streams (+creation time for the TTL sweep), live
+    # agent/task refs for cooperative stop (the executor thread may outlive the request,
+    # hence the separate stopping set), pollable statuses, and approval session keys
+    # (approval core resolves by session key, clients by run_id).
     self._run_idempotency_ids: set[str] = set()
-    self._workflow_run_ids: set[str] = set()
-    self._run_stream_subscribers: set[str] = set()
     self._stopping_run_ids: set[str] = set()
-    self._pending_run_admissions: set[str] = set()
-    # The executor holds this lock across final admission and the turn itself.
-    # Stop signals immediately, then waits off-loop before ACKing a turn that
-    # already entered. The lock is never held by the event-loop thread.
-    self._run_entry_locks: dict[str, threading.Lock] = {}
     self._shutdown_interrupted_run_ids: set[str] = set()
     self._run_shutdown_requested_at: Optional[float] = None
+    # Streaming run id -> its canonical admission id, held while that request observes the turn.
+    self._run_admission_aliases: dict[str, str] = {}
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
@@ -363,14 +283,12 @@ def _initialize_run_state(self, *, store_factory) -> None:
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
     return [
-        ("POST", "/v1/runs", self._handle_runs),
-        ("GET", "/v1/workflow-profile/readiness", self._handle_workflow_readiness),
-        ("GET", "/v1/workflow-attempts/{attempt_id}", self._handle_workflow_attempt),
-        ("POST", "/v1/workflow-attempts/{attempt_id}/abort", self._handle_abort_workflow_attempt),
-        ("GET", "/v1/runs/{run_id}", self._handle_get_run),
+        ("POST", "/v1/runs", self._handle_runs), ("GET", "/v1/runs/{run_id}", self._handle_get_run),
         ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
         ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
+        ("POST", "/v1/runs/{run_id}/clarify", self._handle_run_clarify),
         ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
+        ("POST", "/v1/runs/{run_id}/resolve-unknown", self._handle_resolve_unknown_run),
         ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run)]
 
 
@@ -382,6 +300,7 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    retire_api_turn_executor()
     try:
         if getattr(self, "_run_idempotency_store", None) is not None:
             self._run_idempotency_store.close()
@@ -389,7 +308,7 @@ def _close_run_state(self) -> None:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
 
-def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
     """Update pollable run status without exposing private agent objects."""
     now = time.time()
     current = self._run_statuses.get(run_id, {})
@@ -414,14 +333,6 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
             self._run_idempotency_store.update_status(run_id, current)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
-    if run_id in self._workflow_run_ids and should_persist:
-        # A terminal result is not inactive until agent.close and child cleanup finish.
-        try:
-            existing = self._run_idempotency_store.workflow_registry_for_run(self._run_owners[run_id], run_id)
-            if existing is not None and existing["active"]:
-                self._run_idempotency_store.update_workflow_status(run_id, current, active=True)
-        except Exception:
-            logger.exception("[api_server] failed to persist workflow run status %s", run_id)
     return current
 
 
@@ -454,11 +365,11 @@ def _mark_shutdown_requested(self) -> int:
     return marked
 
 
-def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop", *, _api_server):
+def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop, *, _api_server):
     """Return a callback that pushes structured events to the run SSE queue."""
     redact_sensitive_text = _api_server.redact_sensitive_text
 
-    def _push(event: Dict[str, Any]) -> None:
+    def _push(event: dict[str, Any]) -> None:
         self._set_run_status(
             run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
         q = self._run_streams.get(run_id)
@@ -466,7 +377,7 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
             with suppress(Exception):
                 loop.call_soon_threadsafe(q.put_nowait, event)
 
-    def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
+    def _callback(event_type: str, tool_name: str | None = None, preview: str | None = None, args=None, **kwargs):
         # _thinking / subagent.tool / subagent_progress are deliberately dropped (UI noise);
         # lifecycle boundaries must land so clients can observe delegate_task failures.
         fields = _FIXED_EVENT_FIELDS.get(event_type)
@@ -491,15 +402,21 @@ def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop
     return _callback
 
 
-def _room_permission_for(request: "web.Request") -> str:
-    if request.path.endswith("/stop"):
-        return "stop"
-    if request.path.endswith("/approval"):
-        return "approve"
+# Answering a prompt the run raised is one capability whichever tool asked: approvals
+# and clarify share the grant's ``approve`` permission. Acknowledging a lost owner epoch
+# ends the run like a stop, so ``/resolve-unknown`` rides the ``stop`` permission.
+_ROOM_CONTROL_PERMISSIONS = {
+    "/stop": "stop", "/resolve-unknown": "stop", "/approval": "approve", "/clarify": "approve"}
+
+
+def _room_permission_for(request: web.Request) -> str:
+    for suffix, permission in _ROOM_CONTROL_PERMISSIONS.items():
+        if request.path.endswith(suffix):
+            return permission
     return "status" if request.method == "GET" else "dispatch"
 
 
-def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
+def _run_idempotency_scope(self, request: web.Request, *, _api_server) -> str:
     """Opaque auth/profile namespace; never persist bearer credentials."""
     if self._room_grant_token(request):
         claims = self._room_grant_claims(request, permission=_room_permission_for(request))
@@ -508,18 +425,13 @@ def _run_idempotency_scope(self, request: "web.Request", *, _api_server) -> str:
             "room_id", "home_install_id", "authority_gateway_id", "authority_epoch",
             "member_id", "target_install_id", "target_profile"))
     else:
-        if _check_workflow_service_auth(self, request) is None:
-            return _workflow_scope(_workflow_request_profile(_api_server))
         parts = (_api_server._api_request_profile.get() or "default",
                  self._expected_api_key() or "unauthenticated-test-listener")
     return hashlib.sha256("\0".join(map(str, parts)).encode()).hexdigest()
 
 
-def _check_run_auth(self, request: "web.Request", *, permission: str, _api_server) -> "web.Response | None":
+def _check_run_auth(self, request: web.Request, *, permission: str, _api_server) -> web.Response | None:
     if not self._room_grant_token(request):
-        service = _check_workflow_service_auth(self, request)
-        if service is None:
-            return None
         return self._check_auth(request)
     try:
         self._room_grant_claims(request, permission=permission)
@@ -539,8 +451,16 @@ def _owner_alive(owner_pid: int, owner_started: int) -> bool:
         return False
 
 
-def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, Any] | None:
+def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, Any] | None:
     """Hydrate a scoped run status and fail stale owners closed."""
+    from gateway.platforms.api_server_authority_runs import run_projection
+    canonical = run_projection(self, run_id)
+    if canonical is not None:
+        # The documented poll shape: the canonical projection decides status/output/usage; the
+        # retained run record still names the object, the requested model and the served runtime.
+        retained = self._run_statuses.get(run_id) or {}
+        return {"object": "hermes.run", **{key: retained[key] for key in ("model", "runtime", "created_at")
+                                           if key in retained}, **canonical}
     status = self._run_statuses.get(run_id)
     if status is not None:
         if run_id in self._run_idempotency_ids:
@@ -550,46 +470,29 @@ def _durable_run_status(self, request: "web.Request", run_id: str) -> Dict[str, 
     scope = self._run_idempotency_scope(request)
     record = self._run_idempotency_store.status_for_run(
         scope, run_id, retention_until=_room_retention_until(request))
-    service_authorized = _check_workflow_service_auth(self, request) is None
-    if record is None and service_authorized:
-        record = self._run_idempotency_store.workflow_status_for_run(scope, run_id)
     if record is None:
         return None
     status = dict(record["status"])
-    workflow = self._run_idempotency_store.workflow_registry_for_run(scope, run_id) if (
-        service_authorized) else None
-    if workflow is not None and not workflow["active"]:
-        # The already-cleaned durable binding is authoritative; stale in-process
-        # status must not overwrite terminal inactivity after restart.
-        status = dict(record["status"])
     if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())
-        if workflow is not None:
-            # A dead owner does not prove its descendants are gone: stay active
-            # until child-process cleanup is positively observed.
-            self._run_idempotency_store.update_workflow_status(run_id, status, active=workflow["active"])
-        else:
-            self._run_idempotency_store.update_status(run_id, status)
+        self._run_idempotency_store.update_status(run_id, status)
     self._run_statuses[run_id] = status
-    if workflow is not None:
-        self._workflow_run_ids.add(run_id)
-    else:
-        self._run_idempotency_ids.add(run_id)
+    self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope
     return status
 
 
 def _resolve_conversation_history(
     self, body: dict, raw_input: Any, *, _openai_error
-) -> "tuple[List[Dict[str, str]], Any, Any, web.Response | None]":
+) -> tuple[list[dict[str, str]], Any, Any, web.Response | None]:
     """Return ``(history, instructions, stored_session_id, error)``; precedence:
     ``conversation_history`` > ``previous_response_id`` chain > all-but-last ``input`` messages."""
     instructions = body.get("instructions")
     previous_response_id = body.get("previous_response_id")
-    conversation_history: List[Dict[str, str]] = []
+    conversation_history: list[dict[str, str]] = []
     raw_history = body.get("conversation_history")
     if raw_history:
         if not isinstance(raw_history, list):
@@ -622,7 +525,23 @@ def _resolve_conversation_history(
     return conversation_history, instructions, stored_session_id, None
 
 
-def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":
+async def _resolve_chained_history(self, body: dict, raw_input: Any, *, _openai_error):
+    """``_resolve_conversation_history`` with the chain's live session: a deleted chain moves to
+    its next generation (an explicit body ``session_id`` still wins in the caller), and a store
+    that cannot answer is the retryable store verdict (``continued_session``). The last item is the
+    stored session the chain moved past (``walked_from``), else None."""
+    from gateway.platforms.api_server_authority_runs import continued_session
+    # Off the loop: a previous_response_id chain reads (and json-decodes) the stored history.
+    history, instructions, chain_root, error = await asyncio.to_thread(
+        _resolve_conversation_history, self, body, raw_input, _openai_error=_openai_error)
+    stored_session_id = chain_root
+    if error is None:
+        stored_session_id, error = await continued_session(self, chain_root)
+    return history, instructions, stored_session_id, error, (
+        chain_root if stored_session_id and stored_session_id != chain_root else None)
+
+
+def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> web.Response:
     """202 admission response; replays are flagged via ``Idempotency-Replayed``."""
     headers = {"Idempotency-Replayed": "true"} if replayed else {}
     if gateway_session_key:
@@ -631,7 +550,7 @@ def _accepted_response(run_id: str, status: str, gateway_session_key, *, replaye
         {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
 
 
-def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> "web.Response":
+def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> web.Response:
     """409 for a fingerprint conflict, else a 202 replay of the already-admitted run."""
     if outcome == "conflict":
         return _json_error(
@@ -649,12 +568,12 @@ class _RunLaunch:
 
     owner: Any
     run_id: str
-    queue: "asyncio.Queue[Optional[Dict]]"
+    queue: _RunStream
     session_id: str
     gateway_session_key: Optional[str]
     declared_selected: bool
     user_message: str
-    conversation_history: List[Dict[str, str]]
+    conversation_history: list[dict[str, str]]
     # #98619: only continuation paths that reload session history may grant wake authority —
     # a previous_response_id continuation consumes its ResponseStore snapshot instead, and a
     # caller-supplied conversation_history is authoritative for the turn; neither consumes a
@@ -662,19 +581,16 @@ class _RunLaunch:
     session_history_delivery: bool
     agent_kwargs: dict  # ``_create_agent`` keyword arguments (prompt, model overrides, route, room policy)
     request_profile: Any
-    browser_control_principal: Any
-    browser_control_transport_family: Any
-    workflow_claims: Optional[dict] = None
-    workflow_url: str = ""
-    workflow_token: str = ""
-    turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    admission: Any = None
+    walked_from: Optional[str] = None  # the swept stored session the chain moved past (``bind_api_steps``)
 
     @property
     def approval_session_key(self) -> str:
         # Isolated per run: session ids are conversation scopes, not authorization namespaces.
         return self.run_id
 
-    def put_event(self, event: Optional[Dict]) -> None:
+    def put_event(self, event: Optional[dict]) -> None:
         """Enqueue only while this run still owns live transport state."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
             self.queue.put_nowait(event)
@@ -690,11 +606,16 @@ def _forget_run(self, run_id: str, *tables) -> None:
 def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._run_entry_locks, self._shutdown_interrupted_run_ids)
+                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
-    _forget_run(self, run_id, self._run_streams, self._run_streams_created)
+    _forget_run(
+        self,
+        run_id,
+        self._run_streams,
+        self._run_streams_created,
+    )
 
 
 async def _resolve_live_session_id(self, session_id: str) -> str:
@@ -779,55 +700,81 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             _api_server._api_request_profile.reset(token)
 
 
-async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Response":
+def _run_idempotency_identity(self, request, body, gateway_session_key, idempotency_key) -> tuple:
+    """``(principal scope, request fingerprint)`` for a keyed POST /v1/runs; ``("", "")`` unkeyed."""
+    if not idempotency_key:
+        return "", ""
+    return self._run_idempotency_scope(request), hashlib.sha256(json.dumps(
+        {"body": body, "gateway_session_key": gateway_session_key or ""},
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode()).hexdigest()
+
+
+def _run_user_message(raw_input, _openai_error) -> tuple:
+    """POST /v1/runs ``input`` -> ``(user_message, error_response_or_None)``."""
+    if not raw_input:
+        return None, _json_error(_openai_error, "Missing 'input' field", status=400)
+    if isinstance(raw_input, str):
+        user_message = raw_input
+    else:
+        user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
+    if not user_message:
+        return None, _json_error(_openai_error, "No user message found in input", status=400)
+    return user_message, None
+
+
+async def _admit_run_to_authority(
+    self, launch, run_id, session_history_delivery, _declared_selected,
+    idempotency_scope, idempotency_key, _openai_error,
+) -> Optional[web.Response]:
+    """Admit a /v1/runs turn to the session authority FIFO -> ``None``, or the refusal."""
+    from gateway.platforms.api_server_authority_runs import run_admission, store_error_response
+    from gateway.session_api_turn import admit_api_turn_async
+    from gateway.session_contract import SessionRef
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        with self._profile_scope(launch.request_profile):
+            launch.admission = await admit_api_turn_async(self, user_message=launch.user_message,
+                conversation_history=launch.conversation_history, active_run_id=run_id,
+                run_owner_scope=self._run_owners[run_id],
+                turn_author=launch.turn_author,
+                history_from_session=session_history_delivery,
+                session_history_delivery='1' if session_history_delivery else '',
+                bind_declared_conversation=_declared_selected, walked_from=launch.walked_from,
+                **launch.agent_kwargs)
+    except Exception as exc:  # health: allow BLE001 -- answered below; a committed admission is kept
+        # A storage failure after the admission committed (a later media-release write) still
+        # owns that run: forgetting it would let a keyed retry admit the same work twice.
+        owned = None if isinstance(exc, RuntimeStoreError) else await asyncio.to_thread(run_admission, self, run_id)
+        if owned is not None:
+            launch.admission = (owned[0], SessionRef(owned[0].profile_id, owned[1]['target_session_id']), owned[1])
+            return None
+        # A refused admission owns no run: drop every reservation so an exact
+        # retry is refused again instead of replaying a run nobody executes.
+        _forget_run(
+            self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
+            self._run_statuses, self._run_owners, self._run_idempotency_ids)
+        if idempotency_key:
+            self._run_idempotency_store.forget(idempotency_scope, idempotency_key)
+        return store_error_response(_openai_error, exc)
+    return None
+
+
+async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
-    from agent.operator_hold import run_scope, OperatorHoldError, require_generation
+    _openai_error = _api_server._openai_error
+    # Operator stop gate: a held swarm refuses new runs; an authorized operator presents the
+    # generation from control.json (same contract as the chat-completions route).
+    from agent.operator_hold import OperatorHoldError, require_generation, run_scope
     try:
         with run_scope():
             require_generation(request.headers.get("X-Hermes-Operator-Generation"))
-            protected = _workflow_protected(self, _api_server)
-            if protected and _WORKFLOW_TICKET_HEADER not in request.headers:
-                return _json_error(_api_server._openai_error, "Protected profile requires workflow ticket",
-                                   code="workflow_ticket_required", status=403)
-            if _WORKFLOW_TICKET_HEADER in request.headers:
-                return await _handle_workflow_runs(self, request, _api_server=_api_server)
-            return await _handle_admitted_runs(self, request, _api_server=_api_server)
+            return await _handle_runs_admitted(self, request, _api_server=_api_server)
     except OperatorHoldError as exc:
-        return _json_error(_api_server._openai_error, str(exc), code="operator_hold", status=503)
+        return _json_error(_openai_error, str(exc), code="operator_hold", status=503)
 
 
-async def _handle_workflow_runs(self, request, *, _api_server):
-    """Authorize and reserve an SLC attempt; a signed READY ticket alone cannot execute."""
-    from agent.operator_hold import require_released
-    unavailable = lambda: _json_error(_api_server._openai_error, "Workflow admission unavailable",
-                                      code="workflow_admission_unavailable", status=503)
-    auth_error = _check_workflow_service_auth(self, request)
-    if auth_error is not None:
-        return auth_error
-    try:
-        if not _workflow_protected(self, _api_server) or not _workflow_locally_ready(self):
-            return unavailable()
-        secret, _, url, token = _workflow_config(self)
-        if self._room_grant_token(request):
-            return _json_error(_api_server._openai_error, "Workflow room dispatch unsupported", status=401)
-        raw = await request.read()
-        profile = _workflow_request_profile(_api_server)
-        claims = _decode_ticket(request.headers[_WORKFLOW_TICKET_HEADER], secret=secret, raw_body=raw,
-                                profile=profile, transport_key=request.headers.get("Idempotency-Key", ""))
-        if not await _workflow_capable(url, token):
-            return unavailable()
-        require_released("workflow run reservation")
-    except ValueError:
-        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
-    except Exception:
-        logger.exception("Workflow admission configuration unavailable")
-        return unavailable()
-    return await _handle_admitted_runs(self, request, _api_server=_api_server,
-                                       workflow_claims=claims, workflow_url=url, workflow_token=token)
-
-
-async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=None,
-                                workflow_url="", workflow_token=""):
+async def _handle_runs_admitted(self, request: web.Request, *, _api_server) -> web.Response:
     _openai_error = _api_server._openai_error
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -837,8 +784,6 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
-    if not isinstance(body, dict):
-        return _json_error(_openai_error, "Expected a JSON object", status=400)
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
@@ -851,35 +796,18 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
         return _json_error(
             _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
             code="invalid_idempotency_key", status=400)
-    idempotency_scope = idempotency_fingerprint = ""
-    if workflow_claims is not None:
-        if (self._room_grant_token(request) or not idempotency_key or
-                idempotency_key != workflow_claims["transport_key"] or gateway_session_key
-                or body.get("hosted_room_dispatch") or body.get("_room_execution_policy")):
-            return _json_error(_openai_error, "Workflow request binding mismatch", status=401)
-        idempotency_scope = _workflow_scope(workflow_claims["profile"])
-        idempotency_fingerprint = _workflow_fingerprint(workflow_claims)
-    elif idempotency_key:
-        idempotency_scope = self._run_idempotency_scope(request)
-        idempotency_fingerprint = hashlib.sha256(json.dumps(
-            {"body": body, "gateway_session_key": gateway_session_key or ""},
-            sort_keys=True, separators=(",", ":"), ensure_ascii=False,
-        ).encode()).hexdigest()
+    idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
+        self, request, body, gateway_session_key, idempotency_key)
     raw_input = body.get("input")
-    if not raw_input:
-        return _json_error(_openai_error, "Missing 'input' field", status=400)
-    if isinstance(raw_input, str):
-        user_message = raw_input
-    else:
-        user_message = raw_input[-1].get("content", "") if isinstance(raw_input, list) else ""
-    if not user_message:
-        return _json_error(_openai_error, "No user message found in input", status=400)
+    user_message, input_err = _run_user_message(raw_input, _openai_error)
+    if input_err is not None:
+        return input_err
     try:
         turn_author = _api_server._request_turn_author(body)
     except ValueError as exc:
         return _json_error(_openai_error, str(exc), code="invalid_author", status=400)
-    conversation_history, instructions, stored_session_id, history_err = (
-        _resolve_conversation_history(self, body, raw_input, _openai_error=_openai_error))
+    conversation_history, instructions, stored_session_id, history_err, walked_from = await _resolve_chained_history(
+        self, body, raw_input, _openai_error=_openai_error)
     if history_err is not None:
         return history_err
     previous_response_id = body.get("previous_response_id")
@@ -894,18 +822,7 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
         return _json_error(_openai_error, selection_error, status=400)
     # A lost-acceptance replay must resolve even while the original run holds the last
     # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if workflow_claims is not None:
-        outcome, record = self._run_idempotency_store.lookup_workflow(
-            workflow_claims["task_id"], workflow_claims["attempt_no"], workflow_claims["attempt_id"],
-            idempotency_scope, idempotency_fingerprint, workflow_claims["transport_key"])
-        if outcome != "missing":
-            if outcome == "aborted":
-                return _json_error(_openai_error, "Workflow attempt aborted", code="workflow_attempt_aborted", status=409)
-            if outcome == "conflict":
-                return _json_error(_openai_error, "Workflow attempt binding conflict", status=409)
-            return _accepted_response(record["run_id"], record["status"]["status"],
-                                      gateway_session_key, replayed=True)
-    elif idempotency_key:
+    if idempotency_key:
         outcome, record = self._run_idempotency_store.lookup(
             idempotency_scope, idempotency_key, idempotency_fingerprint,
             retention_until=_room_retention_until(request))
@@ -916,7 +833,7 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
     if limited is not None:
         return limited
     run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = idempotency_scope if workflow_claims else self._run_idempotency_scope(request)
+    self._run_owners[run_id] = self._run_idempotency_scope(request)
     # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
     # conversation > run_id (which would otherwise re-key every affinity surface per run).
     # An explicit or chained session owns its routing key and is never rebound to the header.
@@ -941,40 +858,12 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
     session_history_delivery = not previous_response_id and not conversation_history
     if not conversation_history and selected_session_id and not previous_response_id:
         conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    from agent.operator_hold import require_released
-    require_released("API run reservation")
-    q = self._run_streams[run_id] = asyncio.Queue()
+    q = self._run_streams[run_id] = _RunStream()
     created_at = self._run_streams_created[run_id] = time.time()
     self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
     initial_status = self._set_run_status(
-        run_id, "held" if workflow_claims else "queued", created_at=created_at,
-        session_id=session_id, model=body.get("model", self._model_name))
-    if workflow_claims is not None:
-        registry = {key: workflow_claims[key] for key in (
-            "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
-            "payload_sha256", "transport_key")}
-        registry.update(run_id=run_id, status="held", active=True)
-        try:
-            outcome, record = self._run_idempotency_store.reserve_workflow(
-                workflow_claims["task_id"], workflow_claims["attempt_no"], idempotency_scope,
-                idempotency_fingerprint, run_id, initial_status, registry,
-                owner_pid=self._run_owner_pid, owner_started=self._run_owner_started)
-        except Exception:
-            logger.exception("Workflow durable reservation failed")
-            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
-                        self._run_approval_sessions, self._run_statuses, self._run_owners)
-            return _json_error(_openai_error, "Workflow reservation unavailable", status=503)
-        if outcome != "created":
-            _forget_run(self, run_id, self._run_streams, self._run_streams_created,
-                        self._run_approval_sessions, self._run_statuses, self._run_owners)
-            if outcome == "aborted":
-                return _json_error(_openai_error, "Workflow attempt aborted", code="workflow_attempt_aborted", status=409)
-            if outcome == "conflict":
-                return _json_error(_openai_error, "Workflow attempt binding conflict", status=409)
-            return _accepted_response(record["run_id"], record["status"]["status"],
-                                      gateway_session_key, replayed=True)
-        self._workflow_run_ids.add(run_id)
-    elif idempotency_key:
+        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
+    if idempotency_key:
         outcome, record = self._run_idempotency_store.reserve(
             idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
             owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
@@ -993,22 +882,21 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
             route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
             **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
         request_profile=_api_server._api_request_profile.get(),
-        browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        workflow_claims=workflow_claims, workflow_url=workflow_url, workflow_token=workflow_token,
-        turn_author=turn_author)
+        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    # A workflow ticket is only a reservation: never dispatch it before the SLC release gate.
-    self._pending_run_admissions.add(run_id)
-    try:
-        admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if (
-            selected_session_id and workflow_claims is None) else None
-    finally:
-        self._pending_run_admissions.discard(run_id)
+    # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
+    # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
+    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    _retarget_to_delivered_chat(self, launch, admitted)
+    if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
+        refused = await _admit_run_to_authority(
+            self, launch, run_id, session_history_delivery, _declared_selected,
+            idempotency_scope, idempotency_key, _openai_error)
+        if refused is not None:
+            return refused
     self._activate_admitted_request()
-    self._run_entry_locks[run_id] = threading.Lock()
     if admitted is not None:
         task = self._active_run_tasks[run_id] = asyncio.create_task(
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
@@ -1018,11 +906,19 @@ async def _handle_admitted_runs(self, request, *, _api_server, workflow_claims=N
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "held" if workflow_claims else "started",
-                              gateway_session_key, replayed=False)
+    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
 
 
-def _run_usage(agent) -> Dict[str, int]:
+def _retarget_to_delivered_chat(self, launch: _RunLaunch, admitted) -> None:
+    """The owner moved an API-held "Bot Chat" title aside and the turn landed in the local chat it
+    minted (MSG-21): the run record (and its idempotency replay) names that chat, not the old row."""
+    delivered = admitted[1].get("session_id") if admitted is not None else None
+    if delivered and delivered != launch.session_id:
+        launch.session_id = delivered
+        self._set_run_status(launch.run_id, "queued", session_id=delivered)
+
+
+def _run_usage(agent) -> dict[str, int]:
     """Terminal ``usage`` payload from the agent's session counters; a missing or non-numeric
     counter (test doubles, agents without cache accounting) reads as ``0``."""
     usage = {}
@@ -1032,7 +928,7 @@ def _run_usage(agent) -> Dict[str, int]:
     return usage
 
 
-def _served_runtime(agent) -> Dict[str, str]:
+def _served_runtime(agent) -> dict[str, str]:
     """The ``{provider, model}`` pair that actually served the turn. After a ``fallback_providers``
     switch the agent keeps the fallback runtime until the NEXT turn restores the primary, so when
     ``run_conversation()`` returns these attributes name the served pair — the run record's
@@ -1070,8 +966,6 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             session_tokens = self._bind_api_server_session(
                 chat_id=session_id or "", session_key=run.approval_session_key, session_id=session_id or "",
                 profile=run.request_profile or "",
-                browser_control_principal=run.browser_control_principal,
-                browser_control_transport_family=run.browser_control_transport_family,
                 # #98619 audited opt-in: the /v1/runs session id is wake-capable only when its
                 # own continuation path reloads session history — an explicit body/chained
                 # session id or a declared X-Hermes-Session-Key conversation (both load
@@ -1088,58 +982,15 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
             register_gateway_notify(run.approval_session_key, approval_notify)
-            # The executor may start after /stop has acknowledged, including a stop
-            # between agent construction and its registration. Never enter a new turn
-            # once that cancellation has been observed.
-            if run.run_id in self._stopping_run_ids or run.run_id in self._shutdown_interrupted_run_ids:
-                return {"interrupted": True}, {}, {}
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
-            _api_server._publish_turn_process_ownership(
-                agent, effective_task_id, session_key=run.approval_session_key,
-            )
+            _api_server._publish_turn_process_ownership(agent, effective_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
-            # The stop flag and the method invocation must share one admission
-            # boundary. Holding this per-run lock for the call means a stop that
-            # arrives after the check cannot ACK while a not-yet-entered turn
-            # might still execute hooks. The stop path signals interruption
-            # before waiting for this lock in a worker (never on the event loop).
-            with self._run_entry_locks[run.run_id]:
-                if run.run_id in self._stopping_run_ids or run.run_id in self._shutdown_interrupted_run_ids:
-                    return {"interrupted": True}, {}, {}
-                from agent.operator_hold import require_released
-                require_released("queued API run worker")
-                r = agent.run_conversation(
-                    user_message=run.user_message, conversation_history=run.conversation_history,
-                    task_id=effective_task_id, **author_kwargs)
+            r = agent.run_conversation(
+                user_message=run.user_message, conversation_history=run.conversation_history,
+                task_id=effective_task_id, **author_kwargs)
         finally:
-            if run.workflow_claims is not None:
-                # A daemon reaper is not cleanup proof: SLC must never see
-                # active=false while descendants can still execute. Keep the
-                # registry active on a failed/unfinished reap.
-                agent._workflow_cleanup_verified = False
-                try:
-                    from gateway.run import _reap_gateway_turn_processes
-                    from tools.process_registry import process_registry
-                    task_id = getattr(agent, "_gateway_turn_process_task_id", "")
-                    session_key = getattr(agent, "_gateway_turn_process_session_key", "")
-                    baseline = getattr(agent, "_gateway_turn_process_baseline", None)
-                    if not task_id and baseline is None:
-                        # Stopped before turn entry: no process ownership was published.
-                        agent._workflow_cleanup_verified = True
-                    elif task_id and baseline is not None:
-                        _reap_gateway_turn_processes(
-                            task_id, baseline, source="api_server_workflow_completion",
-                            session_key=session_key)
-                        agent._workflow_cleanup_verified = not (
-                            process_registry.snapshot_running_ids(task_id, session_key=session_key) - baseline)
-                except Exception:
-                    logger.exception("Workflow process cleanup failed for %s", run.run_id)
-            elif self._reap_background_processes_on_run_completion:
-                _api_server._reap_disconnected_agent_processes(
-                    agent, source="api_server_run_completion",
-                )
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
             self._memory_sessions.checkin(agent)
@@ -1156,23 +1007,13 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         return r, _run_usage(agent), _served_runtime(agent)
 
 
-def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Dict[str, Any]], None]:
+def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[dict[str, Any]], None]:
     """Approval-request bridge: redact, stamp the event envelope, park the run status, enqueue."""
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
-    def _approval_notify(approval_data: Dict[str, Any]) -> None:
-        event = dict(approval_data or {})
-        # Clients must never receive the raw flagged command: redact before it hits the stream.
-        # Redact credentials from the command before it enters the SSE/API event stream — same egress bug as
-        # #48456, second transport: API/desktop clients would otherwise receive the raw command Tirith
-        # flagged. Reuse the gateway seam.
-        if "command" in event:
-            from gateway.run import _redact_approval_command
-            event["command"] = _redact_approval_command(event.get("command"))
-        event.update(_run_event(run_id, "approval.request", choices=_api_server._approval_event_choices(
-            smart_denied=bool(event.get("smart_denied")),
-            allow_session=event.get("allow_session") is not False,
-            allow_permanent=event.get("allow_permanent") is not False)))
+    def _approval_notify(approval_data: dict[str, Any]) -> None:
+        # Clients must never receive the raw flagged command (#48456): the shared builder redacts.
+        event = _api_server._approval_request_event(run_id, approval_data)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
         with suppress(Exception):
             loop.call_soon_threadsafe(q.put_nowait, event)
@@ -1180,7 +1021,7 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[Di
     return _approval_notify
 
 
-async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: Dict[str, Any], *, _api_server) -> None:
+async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[str, Any], *, _api_server) -> None:
     """Drive a run whose turn a live Bot Chat owner is executing, from that owner's mailbox receipt.
 
     The receipt is the only truth about the turn: ``settled`` completes the run with the owner's
@@ -1189,7 +1030,7 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: Dict[
     as ``cancelled`` while the chat finishes on its own; the stop handler already reports that a
     run without an in-process agent is not interruptible here.
     """
-    from tools.bot_live_delivery import await_delivery_async
+    from gateway.platforms.api_server_bot_chat import await_live_delivery
 
     run_id = run.run_id
     delivery_id = record["delivery_id"]
@@ -1205,8 +1046,8 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: Dict[
 
     try:
         self._set_run_status(run_id, "running", delivery_id=delivery_id)
-        record = await await_delivery_async(
-            home, delivery_id, None, should_stop=lambda: run_id in self._stopping_run_ids) or record
+        record = await await_live_delivery(
+            self, home, record, None, should_stop=lambda: run_id in self._stopping_run_ids)
         if record["status"] in ("queued", "claimed"):
             _finish("cancelled", completed=False, partial=False, interrupted=True)
             return
@@ -1235,6 +1076,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    _run_started_at = time.perf_counter()
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -1261,70 +1103,62 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             extra = {}
         self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
         with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields, **extra))
+            # A worker can finish before its Future is wrapped, so awaiting it
+            # need not yield to already-scheduled commentary/tool callbacks.
+            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
 
-    agent = None
-    run_budget_watchdog = None
-    executor_finished = True
     try:
         # Shutdown landed between admission and the task's first tick: nothing to
         # interrupt yet, and starting a turn now would outlive the gateway.
         if run_id in self._shutdown_interrupted_run_ids:
             _finish("interrupted")
             return
-        if run.workflow_claims is not None:
-            released = await _wait_for_workflow_release(
-                run.workflow_claims, run_id, run.workflow_url, run.workflow_token,
-                lambda: run_id in self._stopping_run_ids or run_id in self._shutdown_interrupted_run_ids)
-            if not released:
-                _finish("cancelled")
-                return
-            # No agent construction, hooks or tools can occur before the exact SLC Started binding.
-        from agent.operator_hold import require_released
-        require_released("API run dispatch")
         self._set_run_status(run_id, "running")
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
-        self._active_run_agents[run_id] = agent
-        # /stop may have run during synchronous _create_agent, before there was
-        # an agent to interrupt. No await occurs between this check and dispatch;
-        # the executor also checks the stopping flag at its own entry boundary.
-        if run_id in self._stopping_run_ids:
-            _finish("cancelled")
-            return
-        run_budget_watchdog = _api_server._start_api_run_budget_watchdog(agent, run_id)
-        approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        from tools.thread_context import propagate_context_to_thread
-        executor_finished = False
-        executor = _submit_api_worker(
-            loop, propagate_context_to_thread(
-                lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server)))
-        try:
-            result, usage, served_runtime = await asyncio.shield(executor)
-            executor_finished = True
-        except asyncio.CancelledError:
-            # A cancelled coroutine is not proof that its executor thread (and
-            # children) have stopped. Keep the binding active until it returns.
-            _unregister_approval_notify(run.approval_session_key)
-            with suppress(Exception):
-                _api_server.request_hard_interrupt(agent, "Run cancelled")
-            _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_cancel")
-            try:
-                await asyncio.shield(executor)
-            except Exception:
-                pass
-            executor_finished = executor.done()
-            raise
-        except Exception:
-            executor_finished = executor.done()
-            raise
+        if run.admission is not None:
+            from gateway.session_api_turn import observe_api_controls, observe_api_turn
+            tool_cb = self._make_run_event_callback(run_id, loop)
+
+            def _control_cb(event_type, prompt):
+                # Same authority prompt the WS viewer and GET pending_controls expose, on the
+                # run's own stream so a streaming-only client learns it must respond.
+                with suppress(Exception):
+                    loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **prompt))
+
+            def _tool_start(call_id, name, args):
+                from agent.display import build_tool_preview
+                tool_cb("tool.started", name, build_tool_preview(name, args or {}) or "", args, tool_call_id=call_id)
+
+            def _tool_complete(call_id, name, args, result):
+                from agent.display import _detect_tool_failure
+                is_error, _ = _detect_tool_failure(name, result)
+                tool_cb("tool.completed", name, None, args, tool_call_id=call_id, is_error=bool(is_error))
+
+            with observe_api_controls(run.admission, _control_cb):
+                result, usage = await observe_api_turn(
+                    run.admission, stream_delta_callback=_text_cb,
+                    tool_start_callback=_tool_start, tool_complete_callback=_tool_complete)
+            # The canonical turn has no agent object here; the served pair rides on the
+            # committed usage/result runtime metadata when the turn recorded one.
+            served_runtime = ((usage or {}).get("runtime") if isinstance(usage, dict) else None) or (
+                result.get("runtime") if isinstance(result, dict) else None) or {}
+        else:
+            with self._profile_scope(run.request_profile):
+                agent = self._create_agent(
+                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                    interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+            self._active_run_agents[run_id] = agent
+            approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
+            result, usage, served_runtime = await _submit_api_worker(
+                loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        # Publish request metrics (daily counters + latency) with each completed run (#52323).
+        self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
         if not isinstance(result, dict):
             result = {}
+        # The committed outcome decides: a stop issued over WS by another viewer interrupts
+        # this run just as much as one issued through this adapter's own /stop.
         status, fields = terminal_run_status(result)
         if status == "cancelled":
             _finish("cancelled", fields)
@@ -1348,31 +1182,21 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
         _finish("failed", error=exc.user_text())
     except Exception as exc:
+        if getattr(exc, "reason", None) == "admission_queued":
+            # Still queued at a retiring owner: the next owner runs it once, and GET /v1/runs/{id}
+            # reads that row. A run.failed here would invite a poller to resubmit it.
+            self._set_run_status(run_id, "queued", last_event="run.queued")
+            with suppress(Exception):
+                loop.call_soon(run.put_event, _run_event(run_id, "run.queued", message=str(exc)))
+            return
         logger.exception("[api_server] run %s failed", run_id)
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
-        if run_budget_watchdog is not None:
-            run_budget_watchdog.cancel()
         # On cancellation (/stop) the executor thread may still block on an approval
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
         with suppress(Exception):
-            run.put_event(None)  # sentinel: close the SSE stream
-        if agent is not None:
-            try:
-                agent.close()
-            except Exception:
-                logger.debug("[api_server] agent close failed for run=%s", run_id, exc_info=True)
-                executor_finished = False
-        if run.workflow_claims is not None and executor_finished and (
-            agent is None or getattr(agent, "_workflow_cleanup_verified", False)
-        ):
-            try:
-                status = self._run_statuses.get(run_id)
-                if status and status.get("status") in TERMINAL_STATUSES:
-                    self._run_idempotency_store.update_workflow_status(run_id, status, active=False)
-            except Exception:
-                logger.exception("Workflow terminal cleanup could not be persisted for %s", run_id)
+            loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
 
 
@@ -1393,7 +1217,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         self._run_owners.pop(run_id, None)
 
 
-def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+def _request_owns_run(self, request: web.Request, run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
@@ -1403,9 +1227,10 @@ def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    return (self._run_idempotency_store.owns_run(scope, run_id)
-            or (_check_workflow_service_auth(self, request) is None
-                and self._run_idempotency_store.workflow_status_for_run(scope, run_id) is not None))
+    if self._run_idempotency_store.owns_run(scope, run_id):
+        return True
+    from gateway.session_api_turn import owns_api_run
+    return owns_api_run(self, run_id, scope)
 
 
 def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
@@ -1413,7 +1238,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     ``(run_id, status, agent, task, error)``; *active_fallback* reports a live in-process run
     without pollable status as ``running`` instead of 404."""
     auth_err = self._check_run_auth(request, permission=permission) if permission else self._check_auth(request)
-    if auth_err is not None:
+    if auth_err:
         return None, None, None, None, auth_err
     _openai_error = _api_server._openai_error
     run_id = request.match_info["run_id"]
@@ -1429,84 +1254,18 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
     return run_id, status, agent, task, None
 
 
-async def _handle_abort_workflow_attempt(self, request: "web.Request", *, _api_server) -> "web.Response":
-    """Service-authenticated, durable pre-POST fence for an SLC reserved attempt."""
-    auth = _check_workflow_service_auth(self, request)
-    if auth is not None:
-        return auth
-    unavailable = lambda: _json_error(_api_server._openai_error, "Workflow abort unavailable", status=503)
-    try:
-        secret, service_key, _, _ = _workflow_config(self)
-        if not secret or not service_key or not self._run_idempotency_store.durable:
-            return unavailable()
-        body = await request.json()
-        if not isinstance(body, dict) or set(body) != {"ticket"}:
-            raise ValueError("Invalid abort body")
-        profile = _workflow_request_profile(_api_server)
-        claims = _decode_ticket(body["ticket"], secret=secret, raw_body=None,
-                                profile=profile, transport_key=None, allow_expired=True)
-        if claims["attempt_id"] != request.match_info["attempt_id"]:
-            raise ValueError("Workflow attempt mismatch")
-    except ValueError:
-        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
-    except (TypeError, KeyError):
-        return _json_error(_api_server._openai_error, "Invalid workflow ticket", status=401)
-    except Exception:
-        logger.exception("Workflow abort configuration unavailable")
-        return unavailable()
-    registry = {key: claims[key] for key in (
-        "attempt_id", "task_id", "assignee", "profile", "queue_ready_event_id", "attempt_no",
-        "payload_sha256", "transport_key")}
-    try:
-        outcome, record = self._run_idempotency_store.abort_workflow(
-            registry, _workflow_scope(profile), _workflow_fingerprint(claims))
-    except Exception:
-        logger.exception("Workflow abort durable reservation failed")
-        return unavailable()
-    if outcome == "admitted":
-        return web.json_response({"error": "Workflow attempt already admitted", "run_id": record["run_id"],
-                                  "status": record["status"], "active": record["active"]}, status=409)
-    if outcome == "conflict":
-        return _json_error(_api_server._openai_error, "Workflow attempt binding conflict", status=409)
-    return web.json_response(record)
-
-
-async def _handle_workflow_attempt(self, request: "web.Request", *, _api_server) -> "web.Response":
-    """Service-only authoritative view of a durable, never-pruned attempt binding."""
-    auth = _check_workflow_service_auth(self, request)
-    if auth is not None:
-        return auth
-    try:
-        record = self._run_idempotency_store.workflow_registry(request.match_info["attempt_id"])
-    except Exception:
-        logger.exception("Workflow registry read failed")
-        return _json_error(_api_server._openai_error, "Workflow registry unavailable", status=503)
-    if record is None or record["profile"] != _workflow_request_profile(_api_server):
-        return _json_error(_api_server._openai_error, "Workflow attempt not found", status=404)
-    if record.get("status") == "aborted" and record.get("aborted") is True and record.get("run_id") is None:
-        return web.json_response(record)
-    run_id = record["run_id"]
-    scope = _workflow_scope(record["profile"])
-    try:
-        stored = self._run_idempotency_store.workflow_status_for_run(scope, run_id)
-    except Exception:
-        return _json_error(_api_server._openai_error, "Workflow registry unavailable", status=503)
-    if stored is None:
-        return _json_error(_api_server._openai_error, "Workflow attempt not found", status=404)
-    return web.json_response(record)
-
-
-async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_get_run(self, request: web.Request, *, _api_server) -> web.Response:
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
     _, status, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
-    return err if err is not None else web.json_response(status)
+    return err or web.json_response(status)
 
 
-async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "web.StreamResponse":
+async def _handle_run_events(self, request: web.Request, *, _api_server) -> web.StreamResponse:
     """GET /v1/runs/{run_id}/events — stream structured agent lifecycle events."""
+    # Same door as GET /v1/runs/{id}: a room grant that may poll the run may stream it.
     auth_err = self._check_run_auth(request, permission="status")
-    if auth_err is not None:
+    if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
     if not self._request_owns_run(request, run_id):
@@ -1522,28 +1281,76 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
         await asyncio.sleep(0.05)
     else:
         return _run_not_found(_api_server._openai_error, run_id)
-    q = self._run_streams[run_id]
-    self._run_stream_subscribers.add(run_id)
-    response = web.StreamResponse(status=200, headers={
-        "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    await response.prepare(request)
+    stream = self._run_streams[run_id]
+    raw_last_seq = request.headers.get("Last-Event-ID") or request.query.get("last_seq")
     try:
+        last_seq = max(-1, int(str(raw_last_seq).strip())) if raw_last_seq is not None else -1
+    except (TypeError, ValueError):
+        last_seq = -1
+    q, replay = stream.attach(last_seq)
+    response = web.StreamResponse(status=200, headers=self._sse_headers(request))
+
+    async def _write(data: bytes) -> None:
+        try:
+            async with asyncio.timeout(_RUN_STREAM_WRITE_TIMEOUT):
+                await response.write(data)
+        except TimeoutError:
+            with suppress(Exception):
+                response.force_close()
+            raise
+
+    async def _write_event(seq: int, event: dict[str, Any]) -> None:
+        payload = dict(event)
+        payload["seq"] = seq
+        await _write(_api_server._sse_frame(payload, id=seq))
+
+    prepared = False
+    try:
+        await response.prepare(request)
+        prepared = True
+        # Flush the response head before waiting on the queue: aiohttp holds the headers
+        # until the first body write, so a subscriber that connects before the run's first
+        # event (e.g. before `approval.request`) sees no bytes and fetch()/EventSource never
+        # resolve. A comment frame is ignored by every conforming SSE consumer.
+        await _write(b": open\n\n")
+        if replay and replay[0][0] > last_seq + 1:
+            truncation = _run_event(
+                run_id,
+                "replay.truncated",
+                oldest_retained_seq=replay[0][0],
+            )
+            if raw_last_seq is not None:
+                truncation["requested_seq"] = last_seq
+            await _write(_api_server._sse_frame(truncation))
+        for seq, event in replay:
+            if event is None:
+                await _write(b": stream closed\n\n")
+                return response
+            await _write_event(seq, event)
+        if stream.terminal and q.empty():
+            await _write(b": stream closed\n\n")
+            return response
         while True:
             try:
-                event = await asyncio.wait_for(
+                seq, event = await asyncio.wait_for(
                     q.get(), timeout=_api_server.CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-            except asyncio.TimeoutError:
-                await response.write(b": keepalive\n\n")
+            except TimeoutError:
+                await _write(b": keepalive\n\n")
                 continue
-            if event is None:  # run finished
-                await response.write(b": stream closed\n\n")
+            if event is _RUN_STREAM_SUBSCRIBER_OVERFLOW:
+                logger.debug("[api_server] closing slow SSE subscriber for run %s", run_id)
                 break
-            await response.write(_api_server._sse_frame(event))
+            if event is None:  # run finished
+                await _write(b": stream closed\n\n")
+                break
+            await _write_event(seq, event)
     except Exception as exc:
+        if not prepared:
+            raise
         logger.debug("[api_server] SSE stream error for run %s: %s", run_id, exc)
     finally:
-        self._run_stream_subscribers.discard(run_id)
-        _drop_run_transport(self, run_id)
+        stream.detach(q)
+        self._release_run_owner_if_forgotten(run_id)
     return response
 
 
@@ -1559,7 +1366,7 @@ def _mark_run_event(self, run_id: str, name: str, **fields: Any) -> None:
 _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
 
 
-async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
     run_id, _, _, _, err = _load_owned_run(
@@ -1570,6 +1377,10 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         body = await request.json()
     except Exception:
         return _json_error(_openai_error, "Invalid JSON", status=400)
+    if getattr(self.gateway_runner, 'session_authority', None) is not None:
+        if self._room_grant_token(request) and body.get('choice') not in {'once', 'deny'}:
+            return _json_error(_openai_error, 'Room approvals require once or deny', status=400)
+        return await _respond_authority_run(self, run_id, body, kind='approval', _api_server=_api_server)
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
     room_scoped = bool(self._room_grant_token(request))
@@ -1610,19 +1421,49 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
         "resolved": resolved})
 
 
-async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _respond_authority_run(self, run_id, body, *, kind, _api_server):
+    from gateway.platforms.api_server_authority_runs import respond_run, store_error_response
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        result = await respond_run(self, run_id, body, kind=kind)
+        return web.json_response({'run_id': run_id, **result})
+    except RuntimeStoreError as exc:
+        return store_error_response(_api_server._openai_error, exc)
+
+
+async def _handle_run_clarify(self, request, *, _api_server):
+    run_id, _, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="approve", active_fallback=False)
+    if err is not None:
+        return err
+    body, err = await self._read_json_body(request)
+    if err is not None:
+        return err
+    return await _respond_authority_run(self, run_id, body, kind='clarify', _api_server=_api_server)
+
+
+def _steer_refused(_openai_error, run_id):
+    return _json_error(_openai_error, f"Run is not currently accepting steer input: {run_id}",
+                       code="run_not_accepting_steer", status=409)
+
+
+async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
     run_id, status, agent, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
+    owned = None
+    if getattr(self.gateway_runner, 'session_authority', None) is not None:
+        from gateway.platforms.api_server_authority_runs import run_admission
+        owned = run_admission(self, run_id)
+        owned = owned if run_id not in self._stopping_run_ids else None
+        agent = None
     # /stop keeps agent refs during cooperative shutdown, so the status gate (not the
     # agent ref) is what rejects stop-then-steer.
-    if status.get("status") != "running" or not hasattr(agent, "steer"):
-        return _json_error(
-            _openai_error, f"Run is not currently accepting steer input: {run_id}",
-            code="run_not_accepting_steer", status=409)
+    if status.get("status") != "running" or (owned is None and not hasattr(agent, "steer")):
+        return _steer_refused(_openai_error, run_id)
     body, err = await self._read_json_body(request)
     if err:
         return err
@@ -1632,6 +1473,23 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
         return _json_error(
             _openai_error, "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
             code="invalid_steer_input", status=400)
+    if owned is not None:
+        from gateway.session_contract import SessionRef
+        from hermes_state_runtime import RuntimeStoreError
+        authority, row = owned
+        sid, latched = row['target_session_id'], False
+        try:
+            with authority.sessions[sid].event_stream.lock:
+                authority.check_approval_generation(sid, row['generation'])
+                # Before the claimed turn adopts its agent the steer is latched for that agent.
+                agent, latched = authority.steer_agent(SessionRef(authority.profile_id, sid), row['generation'], steer_text)
+        except (KeyError, RuntimeStoreError):
+            agent = None
+        if not latched and not hasattr(agent, "steer"):
+            return _steer_refused(_openai_error, run_id)
+        if latched:
+            _mark_run_event(self, run_id, "run.steered", accepted=True)
+            return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
     try:
         accepted = bool(agent.steer(steer_text))
     except Exception as exc:
@@ -1644,46 +1502,59 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
 
-def _wait_for_run_entry(entry_lock: threading.Lock) -> None:
-    """Wait for an admitted turn to exit without blocking the HTTP event loop."""
-    with entry_lock:
-        pass
-
-
-async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
+async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
     run_id, status, agent, task, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
+    # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
+    # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
+    if (getattr(self.gateway_runner, 'session_authority', None) is not None
+            and not (task is not None and status.get("delivery_id"))):
+        from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            return web.json_response(await stop_run(self, run_id))
+        except RuntimeStoreError as exc:
+            return store_error_response(_openai_error, exc)
     if status.get("status") in TERMINAL_STATUSES:
         return web.json_response(status)
     if agent is None and task is None:
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
-    self._stopping_run_ids.add(run_id)
     self._set_run_status(run_id, "stopping", last_event="run.stopping")
-    # Keep a local reference: completion may retire the run before we acquire.
-    entry_lock = self._run_entry_locks.get(run_id)
+    self._stopping_run_ids.add(run_id)
     if agent is not None:
         with suppress(Exception):
             _api_server.request_hard_interrupt(agent, "Stop requested via API")
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
-    if entry_lock is not None:
-        # The lock covers both the last pre-entry check and the whole turn. A
-        # timed-out wait cannot distinguish those cases: leave the stop flag,
-        # live refs and pollable status intact until the executor actually exits.
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(_wait_for_run_entry, entry_lock),
-                timeout=_RUN_STOP_ENTRY_WAIT_SECONDS)
-        except asyncio.TimeoutError:
-            pass
     return web.json_response({"run_id": run_id, "status": "stopping"})
+
+
+async def _handle_resolve_unknown_run(
+    self, request: web.Request, *, _api_server
+) -> web.Response:
+    """POST /v1/runs/{run_id}/resolve-unknown — acknowledge one lost owner epoch."""
+    run_id, _, _, _, err = _load_owned_run(
+        self, request, _api_server=_api_server, permission="stop", active_fallback=False)
+    if err is not None:
+        return err
+    try:
+        body = await request.json()
+    except (ValueError, LookupError):  # bad JSON/UTF-8 (ValueError) or unknown charset: no body
+        body = None
+    from gateway.platforms.api_server_authority_runs import resolve_unknown_run, store_error_response
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        result = await resolve_unknown_run(self, run_id, body)
+        return web.json_response({'run_id': run_id, **result})
+    except RuntimeStoreError as exc:
+        return store_error_response(_api_server._openai_error, exc)
 
 
 async def _sweep_orphaned_runs(self) -> None:
@@ -1697,47 +1568,9 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     """Expire old SSE buffers without treating transport age as run age."""
     if now is None:
         now = time.time()
-    # A non-terminal poll-ledger row without a live task is an orphan, not
-    # active execution. Repair it so clients do not poll "running" forever.
-    orphaned = [
-        (run_id, status, self._active_run_tasks.get(run_id))
-        for run_id, status in list(self._run_statuses.items())
-        if status.get("status") in {"held", "queued", "running", "waiting_for_approval", "stopping"}
-        and run_id not in self._pending_run_admissions
-        and (
-            self._active_run_tasks.get(run_id) is None
-            or self._active_run_tasks[run_id].done()
-        )
-    ]
-    for run_id, status, task in orphaned:
-        cancelled = status.get("status") == "stopping" or bool(
-            task is not None and task.cancelled()
-        )
-        terminal_status = "cancelled" if cancelled else "failed"
-        fields = {"last_event": f"run.{terminal_status}"}
-        if not cancelled:
-            fields["error"] = "Run execution ended without a terminal status update"
-        logger.warning(
-            "[api_server] repairing orphaned run status %s: %s -> %s",
-            run_id, status.get("status"), terminal_status,
-        )
-        self._set_run_status(run_id, terminal_status, **fields)
-        queue = self._run_streams.get(run_id)
-        if queue is not None:
-            event = _run_event(run_id, fields["last_event"])
-            if "error" in fields:
-                event["error"] = fields["error"]
-            with suppress(Exception):
-                queue.put_nowait(event)
-                queue.put_nowait(None)
-        if run_id in self._workflow_run_ids:
-            # A done/cancelled coroutine does not prove an executor thread and its
-            # children exited. Only _execute_run's cleanup may mark inactive.
-            continue
-        _unregister_approval_notify(self._run_approval_sessions.get(run_id))
-        _retire_live_run(self, run_id)
     for run_id, created_at in list(self._run_streams_created.items()):
-        if now - created_at <= self._RUN_STREAM_TTL or run_id in self._run_stream_subscribers:
+        stream = self._run_streams.get(run_id)
+        if now - created_at <= self._RUN_STREAM_TTL or (stream is not None and stream.subscribers):
             continue
         logger.debug("[api_server] sweeping expired run transport %s", run_id)
         task = self._active_run_tasks.get(run_id)
@@ -1749,5 +1582,4 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
     for run_id, status in list(self._run_statuses.items()):
         if (status.get("status") in {"completed", "failed", "cancelled"}
                 and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
-            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids,
-                        self._workflow_run_ids)
+            _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
