@@ -180,7 +180,11 @@ def cron_payload_digest(job):
                "run_claim", "fire_claim", "last_output", "last_response",
                "_scheduled_instant", "execution_id", "latest_execution", "last_dispatch",
                "last_delivery_queued", "last_delivery_error", "last_fire_error",
-               "failure_streak", "preflight_alerted", "manual_run_at", "manual_run_prompt"}
+               "failure_streak", "preflight_alerted", "manual_run_at", "manual_run_prompt",
+               # Written by the engine after every fire; binding them revoked the approval
+               # right after the first successful run (observed live on the support swarm).
+               "canonical_completions", "last_failure", "last_delivery_unverified",
+               "monitor_state", "last_completed_at", "last_success_at", "last_attempt_at"}
     payload = {k: v for k, v in job.items() if k not in runtime}
     # ``repeat`` mixes the operator-approved run limit with a run counter: keep ``times``
     # bound, drop ``completed`` — otherwise each finished run revoke its own approval.
