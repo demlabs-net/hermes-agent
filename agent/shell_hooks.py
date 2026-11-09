@@ -146,6 +146,10 @@ class ShellHookSpec(_ToolMatcherMixin):
     matcher: Optional[str] = None
     timeout: int = DEFAULT_TIMEOUT_SECONDS
     fail_closed: bool = False
+    # DemLabs: per-hook environment from the `env:` map in config.yaml. Merged over
+    # the inherited subprocess env (values win) so SLC hooks get SLC_MCP_URL /
+    # SLC_SEAT_ID / HERMES_HOME without relying on the container's global env.
+    env: dict[str, str] = field(default_factory=dict, repr=False)
     compiled_matcher: Optional[re.Pattern] = field(default=None, repr=False)
 
 
@@ -447,7 +451,17 @@ def _parse_single_entry(event: str, index: int, raw: Any) -> Optional[ShellHookS
         warn(".fail_closed=true will be ignored at runtime — fail_closed only applies to blocking-capable "
              "events (%s).  The hook will fail open on %s like any other hook.", ", ".join(sorted(_BLOCKING_EVENTS)), event)
         fail_closed = False
-    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout, fail_closed=fail_closed)
+    env: dict[str, str] = {}
+    raw_env = raw.get("env")
+    if raw_env is not None:
+        if not isinstance(raw_env, dict):
+            warn(".env must be a mapping of NAME: value; ignoring")
+        else:
+            for key, value in raw_env.items():
+                if isinstance(key, str) and key.strip() and value is not None:
+                    env[str(key).strip()] = str(value)
+    return ShellHookSpec(event=event, command=command.strip(), matcher=matcher, timeout=timeout,
+                         fail_closed=fail_closed, env=env)
 
 
 # --- Subprocess callback ---
@@ -508,9 +522,13 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     try:
         if IS_WINDOWS:
             argv = _windows_script_argv(argv)
+        hook_env = build_subprocess_env(scrub_secrets=is_multiplex_active())
+        if spec.env:
+            # DemLabs: explicit per-hook env from config wins over the inherited one.
+            hook_env.update({k: os.path.expandvars(v) for k, v in spec.env.items()})
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding='utf-8', errors='replace', shell=False,
-                                env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
+                                env=hook_env, **popen_kwargs)
     except Exception as exc:
         for cls, msg in _POPEN_ERRORS:
             if isinstance(exc, cls):
