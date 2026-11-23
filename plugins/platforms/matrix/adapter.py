@@ -2068,6 +2068,32 @@ class MatrixAdapter(BasePlatformAdapter):
         elif msgtype in ("m.text", "m.notice"):
             await self._handle_text_message(room_id, sender, event_id, event_ts, source_content, relates_to)
 
+    async def _reply_targets_bot(self, room_id: str, relates_to: dict, body: str) -> bool:
+        """True when this message replies (``m.in_reply_to``) to an event authored by this bot.
+
+        A reply to the bot's own message addresses the bot exactly like an ``@mention`` or a
+        thread reply does; without this, ``require_mention`` drops every Element-style reply
+        (owner had to re-tag the bot on each answer). The quoted author rides in the plain-text
+        fallback (``> <@bot:server> …``) so the common case needs no network call; when a client
+        strips the fallback we fetch the replied-to event and compare senders.
+        """
+        target = (relates_to.get("m.in_reply_to") or {}).get("event_id")
+        if not target or not self._user_id:
+            return False
+        if body.startswith("> "):
+            _quoted, quote_author = _extract_reply_fallback(body)
+            if quote_author:
+                return quote_author == self._user_id
+        client = self._client
+        if client is None:
+            return False
+        try:
+            event = await client.get_event(RoomID(room_id), EventID(target))
+        except Exception as exc:  # gating must never crash the pipeline
+            logger.debug("Matrix: cannot resolve replied-to event %s in %s: %s", target, room_id, exc)
+            return False
+        return str(getattr(event, "sender", "")) == self._user_id
+
     async def _resolve_message_context(
         self, room_id: str, sender: str, event_id: str, body: str, source_content: dict,
         relates_to: dict, mention_claimed: bool = False,
@@ -2081,6 +2107,12 @@ class MatrixAdapter(BasePlatformAdapter):
         chat_type = "dm" if is_dm else "group"
         thread_id = _thread_root(relates_to)
         is_mentioned = mention_claimed or self._content_mentions_bot(body, source_content)
+        if not is_mentioned and self._require_mention and relates_to.get("m.in_reply_to"):
+            # Replying to the bot's own message counts as addressing it (no @mention needed).
+            is_mentioned = await self._reply_targets_bot(room_id, relates_to, body)
+            if is_mentioned:
+                logger.debug("Matrix: message %s replies to bot in %s — mention requirement satisfied",
+                             event_id, room_id)
         if not is_dm:
             # Whitelist first: non-listed rooms are dropped even when @mentioned (DMs exempt).
             if self._allowed_rooms and room_id not in self._allowed_rooms:

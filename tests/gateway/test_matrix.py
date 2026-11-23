@@ -2300,6 +2300,91 @@ class TestMatrixFreeResponsePolicy:
         assert ctx is not None
 
 
+class TestMatrixReplyToBotCountsAsMention:
+    """Replying to the bot's own message must satisfy ``require_mention`` (owner bug report:
+    an Element reply without re-tagging the bot was silently dropped)."""
+
+    def setup_method(self):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_test",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "require_mention": True,
+            },
+        )
+        self.adapter = MatrixAdapter(config)
+        self.adapter._is_dm_room = AsyncMock(return_value=False)
+        self.adapter._resolve_room_identity = AsyncMock(
+            return_value=MagicMock(display_name="Project Room")
+        )
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+
+    def _ctx(self, body: str, relates_to: dict, sender: str = "@alice:example.org"):
+        return self.adapter._resolve_message_context(
+            room_id="!project:example.org",
+            sender=sender,
+            event_id="$reply",
+            body=body,
+            source_content={"body": body, "m.relates_to": relates_to},
+            relates_to=relates_to,
+        )
+
+    @pytest.mark.asyncio
+    async def test_reply_to_bot_without_tag_is_accepted(self):
+        body = "> <@bot:example.org> previous answer\n\nmake it shorter"
+        relates_to = {"m.in_reply_to": {"event_id": "$botmsg"}}
+        ctx = await self._ctx(body, relates_to)
+        assert ctx is not None
+        assert "make it shorter" in ctx[0]
+
+    @pytest.mark.asyncio
+    async def test_reply_to_another_user_is_still_dropped(self):
+        body = "> <@carol:example.org> her message\n\nunrelated note"
+        relates_to = {"m.in_reply_to": {"event_id": "$carolmsg"}}
+        ctx = await self._ctx(body, relates_to)
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_plain_message_without_mention_is_still_dropped(self):
+        ctx = await self._ctx("hello there", {})
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_reply_without_fallback_resolves_author_via_client(self):
+        """Clients that strip the ``> <@user>`` fallback are covered by an event fetch."""
+        relates_to = {"m.in_reply_to": {"event_id": "$botmsg"}}
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(
+            return_value=MagicMock(sender="@bot:example.org")
+        )
+        ctx = await self._ctx("no pill here", relates_to)
+        assert ctx is not None
+        self.adapter._client.get_event.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reply_without_fallback_to_other_user_is_dropped(self):
+        relates_to = {"m.in_reply_to": {"event_id": "$carolmsg"}}
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(
+            return_value=MagicMock(sender="@carol:example.org")
+        )
+        ctx = await self._ctx("no pill here", relates_to)
+        assert ctx is None
+
+    @pytest.mark.asyncio
+    async def test_event_fetch_failure_does_not_crash_gating(self):
+        relates_to = {"m.in_reply_to": {"event_id": "$gone"}}
+        self.adapter._client = MagicMock()
+        self.adapter._client.get_event = AsyncMock(side_effect=RuntimeError("M_NOT_FOUND"))
+        ctx = await self._ctx("no pill here", relates_to)
+        assert ctx is None
+
+
 class TestMatrixClockSkewWarning:
     """Clock-skew detector for #12614.
 
